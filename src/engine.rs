@@ -22,10 +22,16 @@ pub struct SampleRecord {
     pub name: String,
     pub method: String,
     pub url: String,
+    #[serde(default)]
+    pub request_headers: String,
+    #[serde(default)]
+    pub request_body: String,
     pub status: u16,
     pub elapsed_ms: u64,
     pub success: bool,
     pub response_body: String,
+    #[serde(default)]
+    pub response_headers: String,
     pub error: String,
 }
 
@@ -308,15 +314,21 @@ async fn execute_step(
         }
     };
     builder = builder.timeout(Duration::from_millis(step.request.timeout_ms.max(1)));
-    for pair in context
+    let headers = context
         .project
         .global_headers
         .iter()
         .chain(step.request.headers.iter())
-    {
-        if pair.enabled && !pair.key.trim().is_empty() {
-            builder = builder.header(pair.key.trim(), substitute(&pair.value, &session.variables));
-        }
+        .filter(|pair| pair.enabled && !pair.key.trim().is_empty())
+        .map(|pair| {
+            (
+                pair.key.trim().to_owned(),
+                substitute(&pair.value, &session.variables),
+            )
+        })
+        .collect::<Vec<_>>();
+    for (key, value) in &headers {
+        builder = builder.header(key, value);
     }
     let query_params = step
         .request
@@ -371,12 +383,23 @@ async fn execute_step(
                 .as_ref()
                 .map(|response| response.status().as_u16())
                 .unwrap_or(0);
-            let response_body = match goose_response.response {
-                Ok(response) => response
-                    .text()
-                    .await
-                    .unwrap_or_else(|error| format!("[body read error: {error}]")),
-                Err(error) => format!("[request error: {error}]"),
+            let (response_headers, response_body) = match goose_response.response {
+                Ok(response) => {
+                    let headers = response
+                        .headers()
+                        .iter()
+                        .map(|(key, value)| {
+                            format!("{}: {}", key, value.to_str().unwrap_or("<binary>"))
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let body = response
+                        .text()
+                        .await
+                        .unwrap_or_else(|error| format!("[body read error: {error}]"));
+                    (headers, body)
+                }
+                Err(error) => (String::new(), format!("[request error: {error}]")),
             };
             let assertion_error = check_assertions(step, status, elapsed_ms, &response_body);
             if let Some(reason) = assertion_error.as_deref() {
@@ -393,10 +416,17 @@ async fn execute_step(
                 name: step.name.clone(),
                 method: method_text,
                 url: joined_url.to_string(),
+                request_headers: headers
+                    .iter()
+                    .map(|(key, value)| format!("{key}: {value}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                request_body: truncate(&body, 16_384),
                 status,
                 elapsed_ms,
                 success,
                 response_body: truncate(&response_body, 16_384),
+                response_headers: truncate(&response_headers, 16_384),
                 error: assertion_error.unwrap_or_default(),
             };
             extract_variables(
@@ -603,10 +633,13 @@ fn emit_error(context: &RunContext, step: &TestStep, method: String, message: St
         name: step.name.clone(),
         method,
         url: step.request.url.clone(),
+        request_headers: String::new(),
+        request_body: String::new(),
         status: 0,
         elapsed_ms: 0,
         success: false,
         response_body: String::new(),
+        response_headers: String::new(),
         error: message,
     };
     context.requests.fetch_add(1, Ordering::Relaxed);

@@ -4,7 +4,7 @@ use crate::model::{
     StepAssertion, TestStep, VariableExtractor,
 };
 use eframe::egui::{self, Color32, RichText, Stroke, Vec2};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, File};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, SyncSender};
@@ -16,7 +16,9 @@ const MAX_VISIBLE_SAMPLES: usize = 1_500;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
     Plan,
+    VUsers,
     Monitor,
+    Summary,
     History,
 }
 
@@ -35,6 +37,7 @@ pub struct RoadcuseApp {
     event_rx: Option<Receiver<EngineEvent>>,
     records: VecDeque<SampleRecord>,
     selected_record: Option<SampleRecord>,
+    detail_tab: usize,
     requests: u64,
     errors: u64,
     latencies: VecDeque<u64>,
@@ -65,6 +68,7 @@ impl RoadcuseApp {
             event_rx: None,
             records: VecDeque::new(),
             selected_record: None,
+            detail_tab: 1,
             requests: 0,
             errors: 0,
             latencies: VecDeque::new(),
@@ -233,10 +237,22 @@ impl RoadcuseApp {
                 self.page = Page::Plan;
             }
             if ui
+                .selectable_label(self.page == Page::VUsers, "VUser & CSV")
+                .clicked()
+            {
+                self.page = Page::VUsers;
+            }
+            if ui
                 .selectable_label(self.page == Page::Monitor, "Live Monitor")
                 .clicked()
             {
                 self.page = Page::Monitor;
+            }
+            if ui
+                .selectable_label(self.page == Page::Summary, "Summary Report")
+                .clicked()
+            {
+                self.page = Page::Summary;
             }
             if ui
                 .selectable_label(self.page == Page::History, "History")
@@ -348,85 +364,6 @@ impl RoadcuseApp {
                 ui.label("Global headers");
                 edit_key_values(ui, "global_headers", &mut self.project.global_headers);
             });
-            ui.collapsing("CSV VUser data", |ui| {
-                ui.checkbox(
-                    &mut self.project.vuser_config.use_csv_data,
-                    "Use CSV data for virtual users",
-                );
-                if self.project.vuser_config.use_csv_data {
-                    ui.horizontal(|ui| {
-                        ui.text_edit_singleline(&mut self.project.vuser_config.csv_file_path);
-                        if ui.button("Browse CSV…").clicked() {
-                            if let Some(path) = rfd::FileDialog::new()
-                                .add_filter("CSV", &["csv"])
-                                .pick_file()
-                            {
-                                self.project.vuser_config.csv_file_path =
-                                    path.to_string_lossy().into_owned();
-                            }
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Delimiter");
-                        egui::ComboBox::from_id_salt("csv_delimiter")
-                            .selected_text(match self.project.vuser_config.csv_delimiter.as_str() {
-                                ";" => "Semicolon ;",
-                                "\\t" => "Tab",
-                                "|" => "Pipe |",
-                                _ => "Comma ,",
-                            })
-                            .show_ui(ui, |ui| {
-                                for (delimiter, label) in [
-                                    (",", "Comma ,"),
-                                    (";", "Semicolon ;"),
-                                    ("\\t", "Tab"),
-                                    ("|", "Pipe |"),
-                                ] {
-                                    ui.selectable_value(
-                                        &mut self.project.vuser_config.csv_delimiter,
-                                        delimiter.into(),
-                                        label,
-                                    );
-                                }
-                            });
-                        ui.checkbox(
-                            &mut self.project.vuser_config.recycle_on_eof,
-                            "Recycle rows at EOF",
-                        );
-                    });
-                    ui.label("CSV headers become variables, e.g. ${username}");
-                }
-            });
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                ui.label("Virtual users");
-                ui.add(
-                    egui::DragValue::new(&mut self.project.vuser_config.thread_count)
-                        .range(1..=100_000),
-                );
-                ui.label("Ramp up (s)");
-                ui.add(
-                    egui::DragValue::new(&mut self.project.vuser_config.ramp_up_seconds)
-                        .range(0..=86_400),
-                );
-                ui.checkbox(
-                    &mut self.project.vuser_config.duration_based,
-                    "Run for duration",
-                );
-                if self.project.vuser_config.duration_based {
-                    ui.add(
-                        egui::DragValue::new(&mut self.project.vuser_config.duration_seconds)
-                            .range(1..=86_400),
-                    );
-                    ui.label("seconds");
-                } else {
-                    ui.label("Iterations");
-                    ui.add(
-                        egui::DragValue::new(&mut self.project.vuser_config.loop_count)
-                            .range(1..=1_000_000),
-                    );
-                }
-            });
             ui.add_space(12.0);
             ui.separator();
             ui.horizontal(|ui| {
@@ -493,6 +430,123 @@ impl RoadcuseApp {
                     self.project.modules.remove(index);
                 }
             }
+        });
+    }
+
+    fn vuser_page(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.heading("Thread Group");
+            ui.label("Set the load profile Goose will run for this project.");
+            ui.add_space(12.0);
+            egui::Grid::new("vuser_profile")
+                .num_columns(2)
+                .spacing([16.0, 12.0])
+                .show(ui, |ui| {
+                    ui.label("Virtual users");
+                    ui.add(
+                        egui::DragValue::new(&mut self.project.vuser_config.thread_count)
+                            .range(1..=100_000),
+                    );
+                    ui.end_row();
+                    ui.label("Ramp-up time (seconds)");
+                    ui.add(
+                        egui::DragValue::new(&mut self.project.vuser_config.ramp_up_seconds)
+                            .range(0..=86_400),
+                    );
+                    ui.end_row();
+                    ui.label("Schedule");
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(
+                            &mut self.project.vuser_config.duration_based,
+                            false,
+                            "By iterations",
+                        );
+                        ui.selectable_value(
+                            &mut self.project.vuser_config.duration_based,
+                            true,
+                            "By duration",
+                        );
+                    });
+                    ui.end_row();
+                    if self.project.vuser_config.duration_based {
+                        ui.label("Duration (seconds)");
+                        ui.add(
+                            egui::DragValue::new(&mut self.project.vuser_config.duration_seconds)
+                                .range(1..=86_400),
+                        );
+                    } else {
+                        ui.label("Iterations per user");
+                        ui.add(
+                            egui::DragValue::new(&mut self.project.vuser_config.loop_count)
+                                .range(1..=1_000_000),
+                        );
+                    }
+                    ui.end_row();
+                });
+
+            ui.add_space(18.0);
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.heading("CSV Data Set");
+                ui.checkbox(
+                    &mut self.project.vuser_config.use_csv_data,
+                    "Enable CSV data",
+                );
+            });
+            ui.label("CSV column headers are available as variables such as ${username}.");
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.add_enabled_ui(self.project.vuser_config.use_csv_data, |ui| {
+                    ui.add_sized(
+                        [ui.available_width().min(560.0), 28.0],
+                        egui::TextEdit::singleline(&mut self.project.vuser_config.csv_file_path)
+                            .hint_text("Choose a CSV file…"),
+                    );
+                });
+                if ui
+                    .add_enabled(
+                        self.project.vuser_config.use_csv_data,
+                        egui::Button::new("Browse…"),
+                    )
+                    .clicked()
+                {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("CSV", &["csv"])
+                        .pick_file()
+                    {
+                        self.project.vuser_config.csv_file_path =
+                            path.to_string_lossy().into_owned();
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Delimiter");
+                egui::ComboBox::from_id_salt("csv_delimiter")
+                    .selected_text(match self.project.vuser_config.csv_delimiter.as_str() {
+                        ";" => "Semicolon ;",
+                        "\\t" => "Tab",
+                        "|" => "Pipe |",
+                        _ => "Comma ,",
+                    })
+                    .show_ui(ui, |ui| {
+                        for (delimiter, label) in [
+                            (",", "Comma ,"),
+                            (";", "Semicolon ;"),
+                            ("\\t", "Tab"),
+                            ("|", "Pipe |"),
+                        ] {
+                            ui.selectable_value(
+                                &mut self.project.vuser_config.csv_delimiter,
+                                delimiter.into(),
+                                label,
+                            );
+                        }
+                    });
+                ui.checkbox(
+                    &mut self.project.vuser_config.recycle_on_eof,
+                    "Recycle rows at EOF",
+                );
+            });
         });
     }
 
@@ -599,6 +653,7 @@ impl RoadcuseApp {
                             );
                             if response.clicked() {
                                 self.selected_record = Some(record.clone());
+                                self.detail_tab = 1;
                             }
                             ui.label(format!("{}  {}", record.method, record.name));
                             ui.label(if record.status == 0 {
@@ -622,17 +677,126 @@ impl RoadcuseApp {
                     .strong(),
                 );
             });
-            let mut response_body = record.response_body.clone();
-            ui.add(
-                egui::TextEdit::multiline(&mut response_body)
-                    .desired_rows(4)
-                    .code_editor()
-                    .interactive(false),
-            );
+            ui.horizontal(|ui| {
+                if ui
+                    .selectable_label(self.detail_tab == 0, "Request")
+                    .clicked()
+                {
+                    self.detail_tab = 0;
+                }
+                if ui
+                    .selectable_label(self.detail_tab == 1, "Response")
+                    .clicked()
+                {
+                    self.detail_tab = 1;
+                }
+            });
+            ui.add_space(4.0);
+            if self.detail_tab == 0 {
+                ui.label(RichText::new("Request Headers").strong());
+                let mut headers = record.request_headers.clone();
+                ui.add(
+                    egui::TextEdit::multiline(&mut headers)
+                        .desired_rows(4)
+                        .code_editor()
+                        .interactive(false),
+                );
+                ui.label(RichText::new("Request Body").strong());
+                let mut body = record.request_body.clone();
+                ui.add(
+                    egui::TextEdit::multiline(&mut body)
+                        .desired_rows(5)
+                        .code_editor()
+                        .interactive(false),
+                );
+            } else {
+                ui.label(format!("Status: {}", record.status));
+                ui.label(RichText::new("Response Headers").strong());
+                let mut headers = record.response_headers.clone();
+                ui.add(
+                    egui::TextEdit::multiline(&mut headers)
+                        .desired_rows(3)
+                        .code_editor()
+                        .interactive(false),
+                );
+                ui.label(RichText::new("Response Body").strong());
+                let mut body = record.response_body.clone();
+                ui.add(
+                    egui::TextEdit::multiline(&mut body)
+                        .desired_rows(8)
+                        .code_editor()
+                        .interactive(false),
+                );
+            }
             if !record.error.is_empty() {
                 ui.colored_label(Color32::LIGHT_RED, &record.error);
             }
         }
+    }
+
+    fn summary_page(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.heading("Summary Report");
+            let Some(summary) = self.summary.as_ref() else {
+                ui.add_space(8.0);
+                ui.label("Run a load test to see its summary here.");
+                return;
+            };
+            ui.label(format!(
+                "{} · {} · started {}",
+                summary.project_name,
+                summary.status,
+                format_epoch(summary.started_ms)
+            ));
+            ui.add_space(10.0);
+            ui.horizontal_wrapped(|ui| {
+                metric_card(ui, "Samples", summary.requests.to_string());
+                metric_card(ui, "Errors", summary.errors.to_string());
+                metric_card(
+                    ui,
+                    "Duration",
+                    format!("{:.1}s", summary.duration_ms as f64 / 1000.0),
+                );
+                metric_card(ui, "Average", format!("{:.1} ms", summary.average_ms));
+                metric_card(ui, "P90", format!("{} ms", summary.p90_ms));
+            });
+            ui.add_space(12.0);
+            ui.separator();
+            ui.label(RichText::new("Request Sampler Summary").strong());
+            let mut rows = BTreeMap::<String, (u64, u64, u128)>::new();
+            for sample in &summary.recent_samples {
+                let row = rows.entry(sample.name.clone()).or_default();
+                row.0 += 1;
+                row.1 += u64::from(!sample.success);
+                row.2 += sample.elapsed_ms as u128;
+            }
+            egui::ScrollArea::vertical()
+                .max_height(360.0)
+                .show(ui, |ui| {
+                    egui::Grid::new("summary_sampler_table")
+                        .striped(true)
+                        .min_col_width(90.0)
+                        .show(ui, |ui| {
+                            for heading in ["Sampler", "Samples", "Errors", "Error %", "Avg (ms)"] {
+                                ui.strong(heading);
+                            }
+                            ui.end_row();
+                            for (name, (count, errors, total_ms)) in rows {
+                                let average_ms = total_ms as f64 / count.max(1) as f64;
+                                ui.label(name);
+                                ui.label(count.to_string());
+                                ui.label(errors.to_string());
+                                ui.label(format!(
+                                    "{:.2}%",
+                                    errors as f64 * 100.0 / count.max(1) as f64
+                                ));
+                                ui.label(format!("{average_ms:.1}"));
+                                ui.end_row();
+                            }
+                        });
+                });
+            ui.weak("Sampler rows use the bounded request sample set saved with this run.");
+        });
     }
 
     fn history_page(&mut self, ui: &mut egui::Ui) {
@@ -719,9 +883,12 @@ impl eframe::App for RoadcuseApp {
         self.receive_engine_events();
         self.top_bar(ui);
         ui.separator();
+        ui.add_space(4.0);
         match self.page {
             Page::Plan => self.plan_page(ui),
+            Page::VUsers => self.vuser_page(ui),
             Page::Monitor => self.monitor_page(ui),
+            Page::Summary => self.summary_page(ui),
             Page::History => self.history_page(ui),
         }
         if self.is_running {
