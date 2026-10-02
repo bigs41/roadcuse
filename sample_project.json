@@ -1,0 +1,67 @@
+{
+  "name": "HTTPBin Smoke Load",
+  "description": "Small sample project for the Rust + Goose runner",
+  "baseUrl": "https://httpbin.org",
+  "environments": [],
+  "activeEnvironment": "Default",
+  "globalHeaders": [],
+  "vuserConfig": {
+    "threadCount": 5,
+    "rampUpSeconds": 2,
+    "loopCount": 2,
+    "durationBased": false,
+    "durationSeconds": 30,
+    "testMode": "0 Custom",
+    "useCsvData": false,
+    "csvFilePath": "",
+    "csvVariableNames": "",
+    "csvDelimiter": ",",
+    "recycleOnEOF": true,
+    "stopThreadOnEOF": false,
+    "sharingMode": "shareMode.all"
+  },
+  "modules": [
+    {
+      "id": "sample-module",
+      "name": "HTTP checks",
+      "description": "A starter request",
+      "enabled": true,
+      "testCases": [
+        {
+          "id": "sample-case",
+          "name": "GET sample response",
+          "description": "Verify a simple JSON endpoint",
+          "enabled": true,
+          "steps": [
+            {
+              "id": "sample-step",
+              "name": "GET /json",
+              "enabled": true,
+              "delayMs": 0,
+              "request": {
+                "method": "GET",
+                "url": "/json",
+                "queryParams": [],
+                "pathVariables": [],
+                "headers": [],
+                "bodyType": "NONE",
+                "body": "",
+                "timeoutMs": 10000
+              },
+              "extractors": [],
+              "assertions": [
+                {
+                  "enabled": true,
+                  "type": "STATUS_CODE",
+                  "expectedValue": "200",
+                  "description": "Expected HTTP 200"
+                }
+              ],
+              "postScript": ""
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
