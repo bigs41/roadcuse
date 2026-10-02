@@ -39,6 +39,10 @@ pub struct SampleRecord {
 #[serde(rename_all = "camelCase")]
 pub struct RunSummary {
     pub project_name: String,
+    #[serde(default)]
+    pub users: usize,
+    #[serde(default)]
+    pub ramp_up_seconds: usize,
     pub started_ms: u128,
     pub duration_ms: u128,
     pub requests: u64,
@@ -121,6 +125,8 @@ pub async fn run_project(project: Project, event_tx: SyncSender<EngineEvent>) ->
         .clone();
     let summary = RunSummary {
         project_name: project.name.clone(),
+        users: project.vuser_config.thread_count,
+        ramp_up_seconds: project.vuser_config.ramp_up_seconds,
         started_ms,
         duration_ms,
         requests: context.requests.load(Ordering::Relaxed),
@@ -298,14 +304,11 @@ async fn initialize_user(user: &mut GooseUser) -> TransactionResult {
         return Ok(());
     };
     let row = context.csv_cursor.fetch_add(1, Ordering::Relaxed);
-    let mut variables = context
+    let variables = context
         .project
         .active_variables()
         .map(|(key, value)| (key.to_owned(), value.to_owned()))
         .collect::<HashMap<_, _>>();
-    if let Some(csv_row) = context.csv_rows.get(row % context.csv_rows.len().max(1)) {
-        variables.extend(csv_row.clone());
-    }
     user.set_session_data(UserSession {
         variables,
         csv_row: row,
@@ -322,11 +325,19 @@ async fn execute_project(user: &mut GooseUser) -> TransactionResult {
         return Ok(());
     };
     session.iteration += 1;
-    if !context.csv_rows.is_empty() && session.iteration > 1 {
+    if !context.csv_rows.is_empty() {
+        let raw_row = session.csv_row.saturating_add(session.iteration - 1);
         let row = if context.project.vuser_config.recycle_on_eof {
-            session.csv_row.wrapping_add(session.iteration - 1) % context.csv_rows.len()
+            raw_row % context.csv_rows.len()
+        } else if raw_row < context.csv_rows.len() {
+            raw_row
+        } else if context.project.vuser_config.stop_thread_on_eof {
+            // Goose owns the user loop, so stop issuing this virtual user's
+            // requests once it has exhausted the assigned CSV rows.
+            user.set_session_data(session);
+            return Ok(());
         } else {
-            (session.csv_row + session.iteration - 1).min(context.csv_rows.len() - 1)
+            context.csv_rows.len() - 1
         };
         session.variables.extend(context.csv_rows[row].clone());
     }
@@ -694,11 +705,26 @@ fn load_csv_rows(project: &Project) -> Result<Vec<HashMap<String, String>>> {
         "|" => b'|',
         _ => b',',
     };
+    let variable_names = config
+        .csv_variable_names
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
     let mut reader = csv::ReaderBuilder::new()
+        // Match EchoLoad's CSV Data Set Config: the first row is always a
+        // header row, even when the user overrides the variable names.
+        .has_headers(true)
         .delimiter(delimiter)
         .from_path(path)
         .with_context(|| format!("could not read CSV file {}", path.display()))?;
-    let headers = reader.headers()?.clone();
+    let file_headers = reader.headers()?.clone();
+    let headers = if variable_names.is_empty() {
+        file_headers
+    } else {
+        csv::StringRecord::from(variable_names)
+    };
     reader
         .records()
         .map(|record| {

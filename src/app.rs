@@ -37,6 +37,13 @@ pub struct RoadcuseApp {
     step_editor_tab: usize,
     run_config_tab: usize,
     summary_filter: usize,
+    summary_chart_tab: usize,
+    csv_preview_path: String,
+    csv_preview_delimiter: String,
+    csv_preview_variables: String,
+    csv_preview_headers: Vec<String>,
+    csv_preview_rows: Vec<Vec<String>>,
+    csv_preview_error: Option<String>,
     status: String,
     is_running: bool,
     stop_requested: bool,
@@ -57,6 +64,9 @@ pub struct RoadcuseApp {
     started_ms: u128,
     summary: Option<RunSummary>,
     history: Vec<HistoryEntry>,
+    selected_history_index: Option<usize>,
+    monitor_tab: usize,
+    request_page: usize,
 }
 
 impl RoadcuseApp {
@@ -76,6 +86,13 @@ impl RoadcuseApp {
             step_editor_tab: 0,
             run_config_tab: 0,
             summary_filter: 0,
+            summary_chart_tab: 0,
+            csv_preview_path: String::new(),
+            csv_preview_delimiter: String::new(),
+            csv_preview_variables: String::new(),
+            csv_preview_headers: Vec::new(),
+            csv_preview_rows: Vec::new(),
+            csv_preview_error: None,
             status: "Ready".into(),
             is_running: false,
             stop_requested: false,
@@ -96,6 +113,9 @@ impl RoadcuseApp {
             started_ms: 0,
             summary: None,
             history: load_history(),
+            selected_history_index: None,
+            monitor_tab: 0,
+            request_page: 0,
         }
     }
 
@@ -113,6 +133,8 @@ impl RoadcuseApp {
         self.timeline_latency.clear();
         self.timeline_tps.clear();
         self.summary = None;
+        self.selected_history_index = None;
+        self.request_page = 0;
         self.last_second = 0;
         self.last_request_count = 0;
         let project = self.project.clone();
@@ -256,6 +278,44 @@ impl RoadcuseApp {
         }
     }
 
+    fn load_saved_run(&mut self, index: usize, page: Page) {
+        let Some(entry) = self.history.get(index) else {
+            return;
+        };
+        let summary = entry.summary.clone();
+        self.requests = summary.requests;
+        self.errors = summary.errors;
+        self.started_ms = summary.started_ms;
+        self.records = summary.recent_samples.iter().cloned().collect();
+        self.latencies = summary
+            .recent_samples
+            .iter()
+            .filter(|sample| sample.elapsed_ms > 0)
+            .map(|sample| sample.elapsed_ms)
+            .collect();
+        self.summary = Some(summary.clone());
+        self.selected_record = None;
+        self.selected_history_index = Some(index);
+        self.request_page = 0;
+        self.timeline_latency.clear();
+        self.timeline_tps.clear();
+        let mut buckets = BTreeMap::<u128, (u128, u64)>::new();
+        for sample in &summary.recent_samples {
+            let second = sample.timestamp_ms.saturating_sub(summary.started_ms) / 1000;
+            let bucket = buckets.entry(second).or_default();
+            bucket.0 += sample.elapsed_ms as u128;
+            bucket.1 += 1;
+        }
+        for (_, (latency, count)) in buckets {
+            push_point(
+                &mut self.timeline_latency,
+                latency as f32 / count.max(1) as f32,
+            );
+            push_point(&mut self.timeline_tps, count as f32);
+        }
+        self.page = page;
+    }
+
     fn send_preview(&mut self) {
         let Some((module_index, case_index, step_index)) = self.selected_step else {
             self.status = "Select an API step first".into();
@@ -303,6 +363,63 @@ impl RoadcuseApp {
         self.status = "Sending one-off request…".into();
     }
 
+    fn apply_test_mode(&mut self, mode: &str) {
+        let config = &mut self.project.vuser_config;
+        config.test_mode = mode.to_owned();
+        match mode {
+            "1 Smoke Test" => {
+                config.thread_count = 1;
+                config.ramp_up_seconds = 0;
+                config.duration_based = false;
+                config.loop_count = 1;
+            }
+            "2 Load Test" => {
+                config.thread_count = 50;
+                config.ramp_up_seconds = 30;
+                config.duration_based = true;
+                config.duration_seconds = 120;
+            }
+            "3 Spike Test" => {
+                config.thread_count = 200;
+                config.ramp_up_seconds = 2;
+                config.duration_based = true;
+                config.duration_seconds = 60;
+            }
+            "4 Stress Test" => {
+                config.thread_count = 100;
+                config.ramp_up_seconds = 60;
+                config.duration_based = true;
+                config.duration_seconds = 300;
+            }
+            _ => {}
+        }
+    }
+
+    fn refresh_csv_preview(&mut self) {
+        let path = self.project.vuser_config.csv_file_path.clone();
+        self.csv_preview_path = path.clone();
+        self.csv_preview_delimiter = self.project.vuser_config.csv_delimiter.clone();
+        self.csv_preview_variables = self.project.vuser_config.csv_variable_names.clone();
+        self.csv_preview_headers.clear();
+        self.csv_preview_rows.clear();
+        self.csv_preview_error = None;
+        if path.trim().is_empty() {
+            return;
+        }
+        let delimiter = csv_delimiter(&self.project.vuser_config.csv_delimiter);
+        match read_csv_preview(
+            &path,
+            delimiter,
+            &self.project.vuser_config.csv_variable_names,
+        ) {
+            Ok((headers, rows)) => {
+                self.csv_preview_headers = headers;
+                self.csv_preview_rows = rows;
+            }
+            Err(error) => self.csv_preview_error = Some(error),
+        }
+    }
+
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.heading(
@@ -312,39 +429,25 @@ impl RoadcuseApp {
             );
             ui.label(RichText::new("Rust + Goose Load Tester").weak());
             ui.separator();
-            if ui
-                .selectable_label(self.page == Page::Plan, "Test Plan")
-                .clicked()
-            {
-                self.page = Page::Plan;
-            }
-            if self.page == Page::StepEditor {
-                ui.label(RichText::new("› Edit API").color(Color32::from_rgb(139, 101, 255)));
-            }
-            if ui
-                .selectable_label(self.page == Page::VUsers, "VUser & CSV")
-                .clicked()
-            {
-                self.page = Page::VUsers;
-            }
-            if ui
-                .selectable_label(self.page == Page::Monitor, "Live Monitor")
-                .clicked()
-            {
-                self.page = Page::Monitor;
-            }
-            if ui
-                .selectable_label(self.page == Page::Summary, "Summary Report")
-                .clicked()
-            {
-                self.page = Page::Summary;
-            }
-            if ui
-                .selectable_label(self.page == Page::History, "History")
-                .clicked()
-            {
-                self.page = Page::History;
-            }
+            let base_url = self.project.active_base_url();
+            let base_url = if base_url.chars().count() > 40 {
+                format!("{}…", base_url.chars().take(39).collect::<String>())
+            } else {
+                base_url.to_owned()
+            };
+            ui.label(
+                RichText::new(if self.is_running {
+                    "● RUNNING"
+                } else {
+                    "● IDLE"
+                })
+                .color(if self.is_running {
+                    Color32::LIGHT_GREEN
+                } else {
+                    Color32::GRAY
+                }),
+            );
+            ui.separator();
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if self.is_running {
                     if ui
@@ -370,7 +473,37 @@ impl RoadcuseApp {
                 if ui.add(egui::Button::new("Open")).clicked() {
                     self.open_project();
                 }
+                if ui
+                    .button(format!(
+                        "⚙ {} ({})",
+                        self.project.active_environment, base_url
+                    ))
+                    .clicked()
+                {
+                    self.page = Page::Plan;
+                    self.run_config_tab = 0;
+                }
             });
+        });
+        ui.horizontal(|ui| {
+            for (page, label, icon) in [
+                (Page::Plan, "Test Step Editor", "📝"),
+                (Page::VUsers, "VUser & CSV Import", "👥"),
+                (Page::Monitor, "Live Monitor", "▥"),
+                (Page::Summary, "Summary Report", "▧"),
+                (Page::History, "Test History", "◷"),
+            ] {
+                let selected = match page {
+                    Page::Plan => self.page == Page::Plan || self.page == Page::StepEditor,
+                    _ => self.page == page,
+                };
+                if ui
+                    .selectable_label(selected, format!("{icon}  {label}"))
+                    .clicked()
+                {
+                    self.page = page;
+                }
+            }
         });
         ui.horizontal(|ui| {
             ui.label(RichText::new(&self.status).color(if self.is_running {
@@ -382,6 +515,85 @@ impl RoadcuseApp {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(RichText::new(path.display().to_string()).small().weak());
                 });
+            }
+        });
+    }
+
+    fn tree_sidebar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading("Test Modules & Cases");
+            if ui.small_button("＋ Module").clicked() {
+                self.project.modules.push(Default::default());
+                self.selected_case = (self.project.modules.len() - 1, 0);
+            }
+        });
+        ui.separator();
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.label(RichText::new(&self.project.name).strong());
+            let mut add_case = None;
+            for (module_index, module) in self.project.modules.iter().enumerate() {
+                egui::CollapsingHeader::new(format!(
+                    "{} ({} test cases)",
+                    module.name,
+                    module.test_cases.len()
+                ))
+                .id_salt(("sidebar_module", module_index))
+                .default_open(true)
+                .show(ui, |ui| {
+                    for (case_index, test_case) in module.test_cases.iter().enumerate() {
+                        let selected = self.selected_case == (module_index, case_index);
+                        egui::CollapsingHeader::new(format!(
+                            "{} ({} steps)",
+                            test_case.name,
+                            test_case.steps.len()
+                        ))
+                        .id_salt(("sidebar_case", module_index, case_index))
+                        .default_open(selected)
+                        .show(ui, |ui| {
+                            if ui.selectable_label(selected, &test_case.name).clicked() {
+                                self.selected_case = (module_index, case_index);
+                                self.page = Page::Plan;
+                            }
+                            for (step_index, step) in test_case.steps.iter().enumerate() {
+                                let label = format!(
+                                    "{} {}",
+                                    step.request.method.as_label(),
+                                    if step.request.url.is_empty() {
+                                        &step.name
+                                    } else {
+                                        &step.request.url
+                                    }
+                                );
+                                if ui
+                                    .selectable_label(
+                                        self.selected_step
+                                            == Some((module_index, case_index, step_index)),
+                                        label,
+                                    )
+                                    .clicked()
+                                {
+                                    self.selected_case = (module_index, case_index);
+                                    self.selected_step =
+                                        Some((module_index, case_index, step_index));
+                                    self.page = Page::StepEditor;
+                                }
+                            }
+                        });
+                    }
+                    if ui.small_button("＋ Add test case").clicked() {
+                        add_case = Some(module_index);
+                    }
+                });
+            }
+            if let Some(module_index) = add_case {
+                self.project.modules[module_index]
+                    .test_cases
+                    .push(Default::default());
+                self.selected_case = (
+                    module_index,
+                    self.project.modules[module_index].test_cases.len() - 1,
+                );
+                self.page = Page::Plan;
             }
         });
     }
@@ -412,54 +624,20 @@ impl RoadcuseApp {
                         });
                         ui.add_space(12.0);
                         ui.horizontal(|ui| {
-                            ui.label("Module");
-                            egui::ComboBox::from_id_salt("plan_module")
-                                .selected_text(
-                                    self.project
-                                        .modules
-                                        .get(self.selected_case.0)
-                                        .map(|module| module.name.as_str())
-                                        .unwrap_or("No module"),
+                            ui.heading(
+                                self.project
+                                    .modules
+                                    .get(self.selected_case.0)
+                                    .and_then(|module| module.test_cases.get(self.selected_case.1))
+                                    .map(|test_case| test_case.name.as_str())
+                                    .unwrap_or("Test Plan"),
+                            );
+                            if let Some(test_case) =
+                                self.project.modules.get_mut(self.selected_case.0).and_then(
+                                    |module| module.test_cases.get_mut(self.selected_case.1),
                                 )
-                                .show_ui(ui, |ui| {
-                                    for (index, module) in self.project.modules.iter().enumerate() {
-                                        ui.selectable_value(
-                                            &mut self.selected_case.0,
-                                            index,
-                                            &module.name,
-                                        );
-                                    }
-                                });
-                            if ui.button("＋ Module").clicked() {
-                                self.project.modules.push(Default::default());
-                                self.selected_case = (self.project.modules.len() - 1, 0);
-                            }
-                            if let Some(module) = self.project.modules.get_mut(self.selected_case.0)
                             {
-                                ui.label("Test case");
-                                egui::ComboBox::from_id_salt("plan_case")
-                                    .selected_text(
-                                        module
-                                            .test_cases
-                                            .get(self.selected_case.1)
-                                            .map(|case| case.name.as_str())
-                                            .unwrap_or("No case"),
-                                    )
-                                    .show_ui(ui, |ui| {
-                                        for (index, test_case) in
-                                            module.test_cases.iter().enumerate()
-                                        {
-                                            ui.selectable_value(
-                                                &mut self.selected_case.1,
-                                                index,
-                                                &test_case.name,
-                                            );
-                                        }
-                                    });
-                                if ui.button("＋ Case").clicked() {
-                                    module.test_cases.push(Default::default());
-                                    self.selected_case.1 = module.test_cases.len() - 1;
-                                }
+                                ui.checkbox(&mut test_case.enabled, "Enabled");
                             }
                         });
 
@@ -741,118 +919,246 @@ impl RoadcuseApp {
 
     fn vuser_page(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical().show(ui, |ui| {
-            ui.heading("Thread Group");
-            ui.label("Set the load profile Goose will run for this project.");
+            ui.heading("1. Virtual Users & Test Profile");
+            ui.weak("Choose a test preset or configure virtual users, ramp-up and schedule manually.");
             ui.add_space(12.0);
-            egui::Grid::new("vuser_profile")
-                .num_columns(2)
-                .spacing([16.0, 12.0])
+            egui::Frame::group(ui.style())
+                .inner_margin(egui::Margin::same(16))
                 .show(ui, |ui| {
-                    ui.label("Virtual users");
-                    ui.add(
-                        egui::DragValue::new(&mut self.project.vuser_config.thread_count)
-                            .range(1..=100_000),
-                    );
-                    ui.end_row();
-                    ui.label("Ramp-up time (seconds)");
-                    ui.add(
-                        egui::DragValue::new(&mut self.project.vuser_config.ramp_up_seconds)
-                            .range(0..=86_400),
-                    );
-                    ui.end_row();
-                    ui.label("Schedule");
                     ui.horizontal(|ui| {
-                        ui.selectable_value(
-                            &mut self.project.vuser_config.duration_based,
-                            false,
-                            "By iterations",
-                        );
-                        ui.selectable_value(
-                            &mut self.project.vuser_config.duration_based,
-                            true,
-                            "By duration",
-                        );
-                    });
-                    ui.end_row();
-                    if self.project.vuser_config.duration_based {
-                        ui.label("Duration (seconds)");
-                        ui.add(
-                            egui::DragValue::new(&mut self.project.vuser_config.duration_seconds)
-                                .range(1..=86_400),
-                        );
-                    } else {
-                        ui.label("Iterations per user");
-                        ui.add(
-                            egui::DragValue::new(&mut self.project.vuser_config.loop_count)
-                                .range(1..=1_000_000),
-                        );
-                    }
-                    ui.end_row();
-                });
-
-            ui.add_space(18.0);
-            ui.separator();
-            ui.horizontal(|ui| {
-                ui.heading("CSV Data Set");
-                ui.checkbox(
-                    &mut self.project.vuser_config.use_csv_data,
-                    "Enable CSV data",
-                );
-            });
-            ui.label("CSV column headers are available as variables such as ${username}.");
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                ui.add_enabled_ui(self.project.vuser_config.use_csv_data, |ui| {
-                    ui.add_sized(
-                        [ui.available_width().min(560.0), 28.0],
-                        egui::TextEdit::singleline(&mut self.project.vuser_config.csv_file_path)
-                            .hint_text("Choose a CSV file…"),
-                    );
-                });
-                if ui
-                    .add_enabled(
-                        self.project.vuser_config.use_csv_data,
-                        egui::Button::new("Browse…"),
-                    )
-                    .clicked()
-                {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("CSV", &["csv"])
-                        .pick_file()
-                    {
-                        self.project.vuser_config.csv_file_path =
-                            path.to_string_lossy().into_owned();
-                    }
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.label("Delimiter");
-                egui::ComboBox::from_id_salt("csv_delimiter")
-                    .selected_text(match self.project.vuser_config.csv_delimiter.as_str() {
-                        ";" => "Semicolon ;",
-                        "\\t" => "Tab",
-                        "|" => "Pipe |",
-                        _ => "Comma ,",
-                    })
-                    .show_ui(ui, |ui| {
-                        for (delimiter, label) in [
-                            (",", "Comma ,"),
-                            (";", "Semicolon ;"),
-                            ("\\t", "Tab"),
-                            ("|", "Pipe |"),
-                        ] {
-                            ui.selectable_value(
-                                &mut self.project.vuser_config.csv_delimiter,
-                                delimiter.into(),
-                                label,
-                            );
+                        ui.label(RichText::new("Test Mode").strong());
+                        let mut chosen_mode = None;
+                        egui::ComboBox::from_id_salt("vuser_test_mode")
+                            .selected_text(&self.project.vuser_config.test_mode)
+                            .width(380.0)
+                            .show_ui(ui, |ui| {
+                                for mode in [
+                                    "0 Custom",
+                                    "1 Smoke Test",
+                                    "2 Load Test",
+                                    "3 Spike Test",
+                                    "4 Stress Test",
+                                ] {
+                                    if ui
+                                        .selectable_label(
+                                            self.project.vuser_config.test_mode == mode,
+                                            mode,
+                                        )
+                                        .clicked()
+                                    {
+                                        chosen_mode = Some(mode.to_owned());
+                                    }
+                                }
+                            });
+                        if let Some(mode) = chosen_mode {
+                            self.apply_test_mode(&mode);
                         }
                     });
-                ui.checkbox(
-                    &mut self.project.vuser_config.recycle_on_eof,
-                    "Recycle rows at EOF",
-                );
-            });
+                    ui.add_space(10.0);
+                    let mode_description = match self.project.vuser_config.test_mode.as_str() {
+                        "1 Smoke Test" => "Smoke preset: 1 user, 1 iteration, no ramp-up.",
+                        "2 Load Test" => "Load preset: 50 users over 30s for 120s.",
+                        "3 Spike Test" => "Spike preset: 200 users over 2s for 60s.",
+                        "4 Stress Test" => "Stress preset: 100 users over 60s for 300s.",
+                        _ => "Custom profile. Values below are sent directly to Goose.",
+                    };
+                    egui::Frame::group(ui.style())
+                        .fill(Color32::from_rgb(28, 43, 67))
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new(format!("🚀 {mode_description}"))
+                                    .color(Color32::from_rgb(125, 183, 255)),
+                            );
+                        });
+                    ui.add_space(12.0);
+                    egui::Grid::new("vuser_profile")
+                        .num_columns(3)
+                        .spacing([16.0, 12.0])
+                        .show(ui, |ui| {
+                            ui.label("Virtual Users (Threads)");
+                            ui.add(
+                                egui::DragValue::new(&mut self.project.vuser_config.thread_count)
+                                    .range(1..=100_000),
+                            );
+                            ui.weak("Users running concurrently");
+                            ui.end_row();
+                            ui.label("Ramp-up Period (Seconds)");
+                            ui.add(
+                                egui::DragValue::new(
+                                    &mut self.project.vuser_config.ramp_up_seconds,
+                                )
+                                .range(0..=86_400),
+                            );
+                            ui.weak("Time to start all virtual users");
+                            ui.end_row();
+                            ui.label("Duration / Loop Target");
+                            ui.horizontal(|ui| {
+                                ui.selectable_value(
+                                    &mut self.project.vuser_config.duration_based,
+                                    false,
+                                    "Fixed Iterations",
+                                );
+                                ui.add(
+                                    egui::DragValue::new(&mut self.project.vuser_config.loop_count)
+                                        .range(1..=1_000_000)
+                                        .suffix(" times"),
+                                );
+                            });
+                            ui.end_row();
+                            ui.label("");
+                            ui.horizontal(|ui| {
+                                ui.selectable_value(
+                                    &mut self.project.vuser_config.duration_based,
+                                    true,
+                                    "Fixed Duration",
+                                );
+                                ui.add(
+                                    egui::DragValue::new(
+                                        &mut self.project.vuser_config.duration_seconds,
+                                    )
+                                    .range(1..=86_400)
+                                    .suffix(" sec"),
+                                );
+                            });
+                            ui.end_row();
+                        });
+                });
+
+            ui.add_space(16.0);
+            egui::Frame::group(ui.style())
+                .inner_margin(egui::Margin::same(16))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.heading("2. VUser Data Import (CSV Parameterization)");
+                        ui.checkbox(
+                            &mut self.project.vuser_config.use_csv_data,
+                            "Enable CSV Data Source",
+                        );
+                    });
+                    ui.weak("Feed unique virtual-user data such as username, password and token from CSV.");
+                    ui.add_space(10.0);
+                    let old_path = self.project.vuser_config.csv_file_path.clone();
+                    ui.horizontal(|ui| {
+                        ui.add_enabled_ui(self.project.vuser_config.use_csv_data, |ui| {
+                            ui.add_sized(
+                                [ui.available_width().min(720.0), 30.0],
+                                egui::TextEdit::singleline(
+                                    &mut self.project.vuser_config.csv_file_path,
+                                )
+                                .hint_text("Select a CSV file"),
+                            );
+                        });
+                        if ui
+                            .add_enabled(
+                                self.project.vuser_config.use_csv_data,
+                                egui::Button::new("Browse CSV…"),
+                            )
+                            .clicked()
+                        {
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("CSV", &["csv"])
+                                .pick_file()
+                            {
+                                self.project.vuser_config.csv_file_path =
+                                    path.to_string_lossy().into_owned();
+                            }
+                        }
+                        if ui.button("Generate Sample CSV").clicked() {
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("CSV", &["csv"])
+                                .set_file_name("sample-vusers.csv")
+                                .save_file()
+                            {
+                                match fs::write(
+                                    &path,
+                                    "username,password\nuser001,change-me\nuser002,change-me\n",
+                                ) {
+                                    Ok(()) => {
+                                        self.project.vuser_config.csv_file_path =
+                                            path.to_string_lossy().into_owned();
+                                        self.project.vuser_config.csv_variable_names.clear();
+                                    }
+                                    Err(error) => {
+                                        self.csv_preview_error = Some(error.to_string())
+                                    }
+                                }
+                            }
+                        }
+                    });
+                    let old_delimiter = self.csv_preview_delimiter.clone();
+                    let old_variables = self.csv_preview_variables.clone();
+                    ui.horizontal(|ui| {
+                        ui.label("Variable Names");
+                        ui.add_enabled(
+                            self.project.vuser_config.use_csv_data,
+                            egui::TextEdit::singleline(
+                                &mut self.project.vuser_config.csv_variable_names,
+                            )
+                            .hint_text("Optional, comma-separated names"),
+                        );
+                        ui.label("Delimiter");
+                        egui::ComboBox::from_id_salt("csv_delimiter")
+                            .selected_text(csv_delimiter_label(
+                                &self.project.vuser_config.csv_delimiter,
+                            ))
+                            .show_ui(ui, |ui| {
+                                for (delimiter, label) in [
+                                    (",", "Comma ,"),
+                                    (";", "Semicolon ;"),
+                                    ("\\t", "Tab"),
+                                    ("|", "Pipe |"),
+                                ] {
+                                    ui.selectable_value(
+                                        &mut self.project.vuser_config.csv_delimiter,
+                                        delimiter.into(),
+                                        label,
+                                    );
+                                }
+                            });
+                        ui.checkbox(
+                            &mut self.project.vuser_config.recycle_on_eof,
+                            "Recycle on EOF",
+                        );
+                        ui.checkbox(
+                            &mut self.project.vuser_config.stop_thread_on_eof,
+                            "Stop requests on EOF",
+                        );
+                    });
+                    if old_path != self.csv_preview_path
+                        || old_delimiter != self.project.vuser_config.csv_delimiter
+                        || old_variables != self.project.vuser_config.csv_variable_names
+                    {
+                        self.refresh_csv_preview();
+                    }
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("CSV Data Preview (First 50 Rows)").strong());
+                    if let Some(error) = &self.csv_preview_error {
+                        ui.colored_label(Color32::LIGHT_RED, error);
+                    } else if self.csv_preview_headers.is_empty() {
+                        ui.weak("Choose a CSV file to preview its columns and rows.");
+                    } else {
+                        egui::ScrollArea::both()
+                            .max_height(230.0)
+                            .show(ui, |ui| {
+                                egui::Grid::new("csv_preview_grid")
+                                    .striped(true)
+                                    .min_col_width(110.0)
+                                    .show(ui, |ui| {
+                                        for header in &self.csv_preview_headers {
+                                            ui.strong(header);
+                                        }
+                                        ui.end_row();
+                                        for row in &self.csv_preview_rows {
+                                            for value in row {
+                                                ui.label(value);
+                                            }
+                                            ui.end_row();
+                                        }
+                                    });
+                            });
+                        ui.weak(format!("{} preview rows", self.csv_preview_rows.len()));
+                    }
+                });
         });
     }
 
@@ -1110,6 +1416,59 @@ impl RoadcuseApp {
     }
 
     fn monitor_page(&mut self, ui: &mut egui::Ui) {
+        let mut load_saved_index = None;
+        ui.horizontal(|ui| {
+            ui.heading("Live Monitor");
+            ui.label("Saved test");
+            egui::ComboBox::from_id_salt("monitor_saved_run")
+                .selected_text(
+                    self.selected_history_index
+                        .and_then(|index| self.history.get(index))
+                        .map(|entry| {
+                            format!(
+                                "{} · {} · {} requests",
+                                format_epoch(entry.summary.started_ms),
+                                entry.summary.status,
+                                entry.summary.requests
+                            )
+                        })
+                        .unwrap_or_else(|| "Current run".into()),
+                )
+                .width(380.0)
+                .show_ui(ui, |ui| {
+                    for (index, entry) in self.history.iter().enumerate() {
+                        let label = format!(
+                            "{} · {} · {} requests",
+                            format_epoch(entry.summary.started_ms),
+                            entry.summary.status,
+                            entry.summary.requests
+                        );
+                        if ui
+                            .selectable_label(self.selected_history_index == Some(index), label)
+                            .clicked()
+                        {
+                            load_saved_index = Some(index);
+                        }
+                    }
+                });
+            if ui.button("Refresh").clicked() {
+                self.history = load_history();
+            }
+            if ui.button("Export CSV").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("CSV", &["csv"])
+                    .set_file_name("roadcuse-requests.csv")
+                    .save_file()
+                {
+                    if let Err(error) = export_records_csv(&path, &self.records) {
+                        self.status = format!("Could not export request CSV: {error}");
+                    }
+                }
+            }
+        });
+        if let Some(index) = load_saved_index {
+            self.load_saved_run(index, Page::Monitor);
+        }
         let elapsed_seconds = if self.is_running {
             self.run_elapsed_ms() as f64 / 1000.0
         } else {
@@ -1141,7 +1500,10 @@ impl RoadcuseApp {
                 if self.is_running {
                     self.project.vuser_config.thread_count.to_string()
                 } else {
-                    "0".into()
+                    self.summary
+                        .as_ref()
+                        .map(|summary| summary.users.to_string())
+                        .unwrap_or_else(|| "0".into())
                 },
             );
             metric_card(ui, "Requests", format!("{}", self.requests));
@@ -1151,7 +1513,7 @@ impl RoadcuseApp {
                 "Throughput",
                 format!(
                     "{:.2} req/s",
-                    self.requests as f64 / elapsed_seconds.max(1.0)
+                    self.requests as f64 / elapsed_seconds.max(0.001)
                 ),
             );
             metric_card(ui, "Avg Latency", format!("{average:.1} ms"));
@@ -1183,45 +1545,156 @@ impl RoadcuseApp {
             );
         });
         ui.separator();
-        ui.label(RichText::new("Live request stream").strong());
+        let total_pages = self.records.len().div_ceil(500).max(1);
+        self.request_page = self.request_page.min(total_pages - 1);
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    self.request_page > 0,
+                    egui::Button::new("Previous Requests"),
+                )
+                .clicked()
+            {
+                self.request_page -= 1;
+            }
+            if ui
+                .add_enabled(
+                    self.request_page + 1 < total_pages,
+                    egui::Button::new("Next Requests"),
+                )
+                .clicked()
+            {
+                self.request_page += 1;
+            }
+            ui.label(format!(
+                "Saved requests: page {} ({}, up to 500 per page)",
+                self.request_page + 1,
+                self.records.len()
+            ));
+        });
+        ui.horizontal(|ui| {
+            if ui
+                .selectable_label(self.monitor_tab == 0, "API Endpoint Summary")
+                .clicked()
+            {
+                self.monitor_tab = 0;
+            }
+            if ui
+                .selectable_label(self.monitor_tab == 1, "Live Request Stream Log")
+                .clicked()
+            {
+                self.monitor_tab = 1;
+            }
+        });
+        ui.label(
+            RichText::new(if self.monitor_tab == 0 {
+                "Performance Breakdown by Test Step & Endpoint"
+            } else {
+                "Live Request Stream Log"
+            })
+            .strong(),
+        );
         egui::ScrollArea::vertical()
             .max_height(310.0)
             .show(ui, |ui| {
-                egui::Grid::new("live_sample_grid")
+                egui::Grid::new(("live_sample_grid", self.monitor_tab))
                     .striped(true)
                     .min_col_width(70.0)
                     .show(ui, |ui| {
-                        ui.strong("Result");
-                        ui.strong("Request");
-                        ui.strong("Status");
-                        ui.strong("Latency");
-                        ui.end_row();
-                        for record in self.records.iter().rev() {
-                            let tint = if record.success {
-                                Color32::from_rgb(92, 210, 151)
-                            } else {
-                                Color32::from_rgb(255, 112, 112)
-                            };
-                            let selected = self.selected_record.as_ref().is_some_and(|item| {
-                                item.timestamp_ms == record.timestamp_ms && item.name == record.name
-                            });
-                            let response = ui.selectable_label(
-                                selected,
-                                RichText::new(if record.success { "PASS" } else { "FAIL" })
-                                    .color(tint),
-                            );
-                            if response.clicked() {
-                                self.selected_record = Some(record.clone());
-                                self.detail_tab = 1;
+                        if self.monitor_tab == 0 {
+                            for heading in [
+                                "Method",
+                                "Test Step",
+                                "Request URL",
+                                "Samples",
+                                "Failed",
+                                "Failure %",
+                                "Avg Latency",
+                                "Min (ms)",
+                                "Max (ms)",
+                            ] {
+                                ui.strong(heading);
                             }
-                            ui.label(format!("{}  {}", record.method, record.name));
-                            ui.label(if record.status == 0 {
-                                "ERR".into()
-                            } else {
-                                record.status.to_string()
-                            });
-                            ui.label(format!("{} ms", record.elapsed_ms));
                             ui.end_row();
+                            let mut rows = BTreeMap::<
+                                String,
+                                (String, String, u64, u64, u128, u64, u64),
+                            >::new();
+                            for record in &self.records {
+                                let row = rows.entry(record.name.clone()).or_insert((
+                                    record.method.clone(),
+                                    record.url.clone(),
+                                    0,
+                                    0,
+                                    0,
+                                    u64::MAX,
+                                    0,
+                                ));
+                                row.2 += 1;
+                                row.3 += u64::from(!record.success);
+                                row.4 += record.elapsed_ms as u128;
+                                row.5 = row.5.min(record.elapsed_ms);
+                                row.6 = row.6.max(record.elapsed_ms);
+                            }
+                            for (name, (method, url, samples, failed, total_ms, min_ms, max_ms)) in
+                                rows
+                            {
+                                ui.label(RichText::new(method).color(Color32::LIGHT_BLUE));
+                                ui.label(name);
+                                ui.label(url);
+                                ui.label(samples.to_string());
+                                ui.label(failed.to_string());
+                                ui.label(format!(
+                                    "{:.2}%",
+                                    failed as f64 * 100.0 / samples.max(1) as f64
+                                ));
+                                ui.label(format!(
+                                    "{:.1} ms",
+                                    total_ms as f64 / samples.max(1) as f64
+                                ));
+                                ui.label(min_ms.to_string());
+                                ui.label(max_ms.to_string());
+                                ui.end_row();
+                            }
+                        } else {
+                            for heading in ["Result", "Request", "Status", "Latency"] {
+                                ui.strong(heading);
+                            }
+                            ui.end_row();
+                            for record in self
+                                .records
+                                .iter()
+                                .rev()
+                                .skip(self.request_page * 500)
+                                .take(500)
+                            {
+                                let tint = if record.success {
+                                    Color32::from_rgb(92, 210, 151)
+                                } else {
+                                    Color32::from_rgb(255, 112, 112)
+                                };
+                                let selected = self.selected_record.as_ref().is_some_and(|item| {
+                                    item.timestamp_ms == record.timestamp_ms
+                                        && item.name == record.name
+                                });
+                                let response = ui.selectable_label(
+                                    selected,
+                                    RichText::new(if record.success { "PASS" } else { "FAIL" })
+                                        .color(tint),
+                                );
+                                if response.clicked() {
+                                    self.selected_record = Some(record.clone());
+                                    self.detail_tab = 1;
+                                }
+                                ui.label(format!("{}  {}", record.method, record.name));
+                                ui.label(if record.status == 0 {
+                                    "ERR".into()
+                                } else {
+                                    record.status.to_string()
+                                });
+                                ui.label(format!("{} ms", record.elapsed_ms));
+                                ui.end_row();
+                            }
                         }
                     });
             });
@@ -1320,6 +1793,108 @@ impl RoadcuseApp {
                 metric_card(ui, "Average", format!("{:.1} ms", summary.average_ms));
                 metric_card(ui, "P90", format!("{} ms", summary.p90_ms));
             });
+            let sample_count = summary.recent_samples.len().max(1);
+            let satisfied = summary
+                .recent_samples
+                .iter()
+                .filter(|sample| sample.success && sample.elapsed_ms <= 500)
+                .count();
+            let tolerated = summary
+                .recent_samples
+                .iter()
+                .filter(|sample| sample.success && (501..=1_500).contains(&sample.elapsed_ms))
+                .count();
+            let apdex = (satisfied as f64 + tolerated as f64 / 2.0) / sample_count as f64;
+            let mut sorted_latency = summary
+                .recent_samples
+                .iter()
+                .map(|sample| sample.elapsed_ms)
+                .collect::<VecDeque<_>>();
+            sorted_latency.make_contiguous().sort_unstable();
+            ui.horizontal_wrapped(|ui| {
+                metric_card(
+                    ui,
+                    "Apdex · T=500ms / F=1500ms",
+                    format!("{apdex:.3} · {}", apdex_rating(apdex)),
+                );
+                metric_card(
+                    ui,
+                    "Pass Rate",
+                    format!(
+                        "{:.2}%",
+                        summary.requests.saturating_sub(summary.errors) as f64
+                            * 100.0
+                            / summary.requests.max(1) as f64
+                    ),
+                );
+                metric_card(
+                    ui,
+                    "Average Throughput",
+                    format!(
+                        "{:.2} req/s",
+                        summary.requests as f64
+                            / (summary.duration_ms as f64 / 1000.0).max(0.001)
+                    ),
+                );
+            });
+            ui.add_space(10.0);
+            ui.label(RichText::new("Performance Analytics Charts").strong());
+            ui.horizontal(|ui| {
+                for (index, tab) in [
+                    "Response Times Over Time",
+                    "Throughput (TPS)",
+                    "Response Time Percentiles",
+                    "SLA / Apdex",
+                ]
+                .iter()
+                .enumerate()
+                {
+                    if ui
+                        .selectable_label(self.summary_chart_tab == index, *tab)
+                        .clicked()
+                    {
+                        self.summary_chart_tab = index;
+                    }
+                }
+            });
+            match self.summary_chart_tab {
+                0 => chart(
+                    ui,
+                    "Average Response Time (ms) · sampled timeline",
+                    &self.timeline_latency,
+                    Color32::from_rgb(61, 200, 226),
+                ),
+                1 => chart(
+                    ui,
+                    "Requests per second",
+                    &self.timeline_tps,
+                    Color32::from_rgb(58, 133, 247),
+                ),
+                2 => {
+                    let percentiles = VecDeque::from([
+                        percentile(&sorted_latency, 0.50) as f32,
+                        percentile(&sorted_latency, 0.75) as f32,
+                        percentile(&sorted_latency, 0.90) as f32,
+                        percentile(&sorted_latency, 0.95) as f32,
+                        percentile(&sorted_latency, 0.99) as f32,
+                    ]);
+                    chart(
+                        ui,
+                        "P50 · P75 · P90 · P95 · P99 (ms)",
+                        &percentiles,
+                        Color32::from_rgb(169, 112, 255),
+                    );
+                }
+                _ => {
+                    ui.label(format!(
+                        "Apdex: {apdex:.3} ({}) · Satisfied ≤ 500ms: {} · Tolerated ≤ 1500ms: {} · Frustrated / failed: {}",
+                        apdex_rating(apdex),
+                        satisfied,
+                        tolerated,
+                        sample_count.saturating_sub(satisfied + tolerated)
+                    ));
+                }
+            }
             ui.add_space(12.0);
             ui.separator();
             ui.label(RichText::new("Request Sampler Summary").strong());
@@ -1356,6 +1931,7 @@ impl RoadcuseApp {
                         });
                 });
             ui.weak("Sampler rows use the bounded request sample set saved with this run.");
+            ui.weak("Apdex and sampler aggregates use the most recent 1,500 request samples.");
             ui.add_space(12.0);
             ui.separator();
             ui.label(RichText::new("Request Results").strong());
@@ -1415,41 +1991,89 @@ impl RoadcuseApp {
     }
 
     fn history_page(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Test History");
-        ui.label("Completed runs are saved locally as JSON summaries with recent request details.");
-        ui.separator();
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            for entry in &self.history {
-                let summary = &entry.summary;
-                egui::CollapsingHeader::new(format!(
-                    "{} · {} · {} requests · {} errors",
-                    format_epoch(summary.started_ms),
-                    summary.status,
-                    summary.requests,
-                    summary.errors
-                ))
-                .id_salt(entry.path.clone())
-                .show(ui, |ui| {
-                    ui.label(format!(
-                        "Duration: {:.1}s · Avg: {:.1}ms · P90: {}ms",
-                        summary.duration_ms as f64 / 1000.0,
-                        summary.average_ms,
-                        summary.p90_ms
-                    ));
-                    ui.label(entry.path.display().to_string());
-                    for sample in summary.recent_samples.iter().rev().take(30) {
-                        ui.label(format!(
-                            "{} {} · {} · {}ms · {}",
-                            sample.method,
-                            sample.name,
-                            sample.status,
-                            sample.elapsed_ms,
-                            if sample.success { "PASS" } else { "FAIL" }
-                        ));
-                    }
-                });
+        let mut open_page = None;
+        ui.heading("Saved Load Tests");
+        ui.label("Open a saved run to view its charts, sampler summary and request details.");
+        ui.horizontal(|ui| {
+            if ui.button("Refresh List").clicked() {
+                self.history = load_history();
+                self.selected_history_index = None;
+            }
+            if ui
+                .add_enabled(
+                    self.selected_history_index.is_some(),
+                    egui::Button::new("Open Report"),
+                )
+                .clicked()
+            {
+                open_page = Some(Page::Summary);
+            }
+            if ui
+                .add_enabled(
+                    self.selected_history_index.is_some(),
+                    egui::Button::new("Open Live Monitor"),
+                )
+                .clicked()
+            {
+                open_page = Some(Page::Monitor);
+            }
+            if ui.button("Clear Report Display").clicked() {
+                self.summary = None;
+                self.records.clear();
+                self.selected_record = None;
             }
         });
+        ui.label(format!("{} saved tests", self.history.len()));
+        ui.separator();
+        egui::ScrollArea::both().show(ui, |ui| {
+            egui::Grid::new("test_history_table")
+                .striped(true)
+                .min_col_width(80.0)
+                .show(ui, |ui| {
+                    for heading in [
+                        "Started", "Project", "Status", "VU", "Duration", "Requests", "Failed",
+                        "Avg ms", "req/s",
+                    ] {
+                        ui.strong(heading);
+                    }
+                    ui.end_row();
+                    for (index, entry) in self.history.iter().enumerate() {
+                        let summary = &entry.summary;
+                        let selected = self.selected_history_index == Some(index);
+                        let start = ui.selectable_label(selected, format_epoch(summary.started_ms));
+                        if start.clicked() {
+                            self.selected_history_index = Some(index);
+                        }
+                        ui.label(&summary.project_name);
+                        ui.label(&summary.status);
+                        ui.label(if summary.users == 0 {
+                            "—".into()
+                        } else {
+                            summary.users.to_string()
+                        });
+                        ui.label(format!("{:.1}s", summary.duration_ms as f64 / 1000.0));
+                        ui.label(summary.requests.to_string());
+                        ui.label(summary.errors.to_string());
+                        ui.label(format!("{:.1}", summary.average_ms));
+                        ui.label(format!(
+                            "{:.2}",
+                            summary.requests as f64
+                                / (summary.duration_ms as f64 / 1000.0).max(0.001)
+                        ));
+                        ui.end_row();
+                    }
+                });
+        });
+        if let (Some(index), Some(page)) = (self.selected_history_index, open_page) {
+            self.load_saved_run(index, page);
+        }
+        if let Some(path) = self
+            .selected_history_index
+            .and_then(|index| self.history.get(index))
+            .map(|entry| entry.path.display().to_string())
+        {
+            ui.weak(path);
+        }
     }
 
     fn open_project(&mut self) {
@@ -1465,6 +2089,8 @@ impl RoadcuseApp {
             Ok(project) => {
                 self.project = project;
                 self.project_path = Some(path);
+                self.selected_case = (0, 0);
+                self.selected_step = None;
                 self.status = "Project loaded".into();
             }
             Err(error) => self.status = format!("Could not open project: {error}"),
@@ -1499,14 +2125,31 @@ impl eframe::App for RoadcuseApp {
         self.top_bar(ui);
         ui.separator();
         ui.add_space(4.0);
-        match self.page {
-            Page::Plan => self.plan_page(ui),
-            Page::StepEditor => self.step_editor_page(ui),
-            Page::VUsers => self.vuser_page(ui),
-            Page::Monitor => self.monitor_page(ui),
-            Page::Summary => self.summary_page(ui),
-            Page::History => self.history_page(ui),
-        }
+        let available = ui.available_size();
+        ui.horizontal_top(|ui| {
+            ui.allocate_ui_with_layout(
+                Vec2::new(300.0, available.y),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    egui::Frame::group(ui.style())
+                        .inner_margin(egui::Margin::same(10))
+                        .show(ui, |ui| self.tree_sidebar(ui));
+                },
+            );
+            ui.separator();
+            ui.allocate_ui_with_layout(
+                Vec2::new((available.x - 312.0).max(400.0), available.y),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| match self.page {
+                    Page::Plan => self.plan_page(ui),
+                    Page::StepEditor => self.step_editor_page(ui),
+                    Page::VUsers => self.vuser_page(ui),
+                    Page::Monitor => self.monitor_page(ui),
+                    Page::Summary => self.summary_page(ui),
+                    Page::History => self.history_page(ui),
+                },
+            );
+        });
         if self.is_running {
             ui.ctx().request_repaint_after(Duration::from_millis(200));
         }
@@ -1588,6 +2231,18 @@ fn method_color(method: HttpMethod) -> Color32 {
         HttpMethod::Delete => Color32::from_rgb(240, 102, 112),
         HttpMethod::Patch => Color32::from_rgb(170, 121, 247),
         HttpMethod::Head | HttpMethod::Options => Color32::from_rgb(114, 173, 220),
+    }
+}
+
+fn apdex_rating(score: f64) -> &'static str {
+    if score >= 0.94 {
+        "Excellent"
+    } else if score >= 0.85 {
+        "Good"
+    } else if score >= 0.70 {
+        "Fair"
+    } else {
+        "Poor"
     }
 }
 
@@ -1699,6 +2354,97 @@ fn format_epoch(epoch_ms: u128) -> String {
     let minute = (seconds / 60) % 60;
     let second = seconds % 60;
     format!("Day {days} {hour:02}:{minute:02}:{second:02}")
+}
+
+fn csv_delimiter(value: &str) -> u8 {
+    match value {
+        "\\t" | "\t" => b'\t',
+        ";" => b';',
+        "|" => b'|',
+        _ => b',',
+    }
+}
+
+fn csv_delimiter_label(value: &str) -> &'static str {
+    match value {
+        ";" => "Semicolon ;",
+        "\\t" | "\t" => "Tab",
+        "|" => "Pipe |",
+        _ => "Comma ,",
+    }
+}
+
+fn read_csv_preview(
+    path: &str,
+    delimiter: u8,
+    variable_names: &str,
+) -> Result<(Vec<String>, Vec<Vec<String>>), String> {
+    let names = variable_names
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    let mut reader = csv::ReaderBuilder::new()
+        .delimiter(delimiter)
+        .has_headers(true)
+        .from_path(path)
+        .map_err(|error| error.to_string())?;
+    let file_headers = reader
+        .headers()
+        .map_err(|error| error.to_string())?
+        .iter()
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    let headers = if names.is_empty() {
+        file_headers
+    } else {
+        names
+    };
+    let rows = reader
+        .records()
+        .take(50)
+        .map(|record| {
+            record
+                .map(|record| record.iter().map(ToOwned::to_owned).collect())
+                .map_err(|error| error.to_string())
+        })
+        .collect::<Result<Vec<Vec<String>>, String>>()?;
+    Ok((headers, rows))
+}
+
+fn export_records_csv(
+    path: &std::path::Path,
+    records: &VecDeque<SampleRecord>,
+) -> Result<(), String> {
+    let mut writer = csv::Writer::from_path(path).map_err(|error| error.to_string())?;
+    writer
+        .write_record([
+            "timestamp_ms",
+            "method",
+            "name",
+            "url",
+            "status",
+            "elapsed_ms",
+            "success",
+            "error",
+        ])
+        .map_err(|error| error.to_string())?;
+    for record in records {
+        writer
+            .write_record([
+                record.timestamp_ms.to_string(),
+                record.method.clone(),
+                record.name.clone(),
+                record.url.clone(),
+                record.status.to_string(),
+                record.elapsed_ms.to_string(),
+                record.success.to_string(),
+                record.error.clone(),
+            ])
+            .map_err(|error| error.to_string())?;
+    }
+    writer.flush().map_err(|error| error.to_string())
 }
 
 fn now_ms() -> u128 {

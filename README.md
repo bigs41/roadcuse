@@ -4,14 +4,15 @@ Native desktop HTTP load tester built with Rust, [Goose](https://github.com/tag1
 
 ## Current features
 
-- Desktop test-plan view with an ordered, enable/disable request list, step reordering, add-step menu, and Functional/Performance run-configuration panel.
+- Persistent module → test case → request tree beside the main work area, plus an ordered step editor with enable/disable, reordering, add-step menu, and Functional/Performance run configuration.
+- Virtual-user profiles for Smoke, Load, Spike, and Stress runs, with thread/ramp/duration controls and CSV import, custom variable names, delimiter/EOF options, and a 50-row preview.
 - Dedicated API editor with Headers, Params, Path, Body, Extractors, and Assertions tabs, plus a one-off Send action and response/request detail tabs.
 - HTTP methods GET, POST, PUT, DELETE, PATCH, HEAD, and OPTIONS; URL paths, path variables, query parameters, global/request headers, request body, and timeout.
 - Per-user variables, CSV data, JSONPath/regex response extractors, status/body/response-time/JSONPath assertions, and step delay.
 - Goose execution with concurrent users, ramp-up, iteration or duration mode, cookie-aware users, and Stop control.
-- Live request/error counts, throughput, average and P90 latency, charts, recent request details, and response bodies.
-- Summary report with sampler aggregates, All/Passed/Failed filters, and links from result rows to request details.
-- Open/save project JSON, starter project, and local run history with summary and recent samples.
+- Live Monitor for current or saved runs with performance charts, endpoint aggregates, paged request stream, and CSV export.
+- Summary report with Apdex, request/pass/failure and throughput cards, response-time/TPS/percentile/SLA charts, sampler aggregates, All/Passed/Failed filters, and request details.
+- Test History table with saved run metrics, report/monitor reopening, and local run history with summary and recent samples.
 
 ## Run
 
@@ -21,7 +22,7 @@ Install the stable Rust toolchain, then from this directory:
 cargo run
 ```
 
-Use **Open** to load [`sample_project.json`](sample_project.json), or create a plan in the editor. Configure the target base URL, user count, ramp-up, and iteration/duration profile before starting a run. Use **Save** to persist the project as JSON. Run summaries are stored under `%APPDATA%\roadcuse\history`.
+Use **Open Project** to load [`sample_project.json`](sample_project.json), or create a plan in the editor. Configure the target base URL, user count, ramp-up, iteration/duration profile, and optional CSV source before starting a run. Use **Save** to persist the project as JSON. Run summaries are stored under `%APPDATA%\roadcuse\history`.
 
 For an optimized Windows executable:
 
