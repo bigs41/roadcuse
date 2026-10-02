@@ -4,11 +4,13 @@ Native desktop HTTP load tester built with Rust, [Goose](https://github.com/tag1
 
 ## Current features
 
-- Desktop editor for projects, environments, modules, test cases, and ordered request steps.
+- Desktop test-plan view with an ordered, enable/disable request list, step reordering, add-step menu, and Functional/Performance run-configuration panel.
+- Dedicated API editor with Headers, Params, Path, Body, Extractors, and Assertions tabs, plus a one-off Send action and response/request detail tabs.
 - HTTP methods GET, POST, PUT, DELETE, PATCH, HEAD, and OPTIONS; URL paths, path variables, query parameters, global/request headers, request body, and timeout.
 - Per-user variables, CSV data, JSONPath/regex response extractors, status/body/response-time/JSONPath assertions, and step delay.
 - Goose execution with concurrent users, ramp-up, iteration or duration mode, cookie-aware users, and Stop control.
 - Live request/error counts, throughput, average and P90 latency, charts, recent request details, and response bodies.
+- Summary report with sampler aggregates, All/Passed/Failed filters, and links from result rows to request details.
 - Open/save project JSON, starter project, and local run history with summary and recent samples.
 
 ## Run

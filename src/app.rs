@@ -1,7 +1,7 @@
 use crate::engine::{self, EngineEvent, RunSummary, SampleRecord};
 use crate::model::{
     AssertionType, BodyType, EnvironmentProfile, ExtractorType, HttpMethod, KeyValuePair, Project,
-    StepAssertion, TestStep, VariableExtractor,
+    StepAssertion, VariableExtractor,
 };
 use eframe::egui::{self, Color32, RichText, Stroke, Vec2};
 use std::collections::{BTreeMap, VecDeque};
@@ -16,6 +16,7 @@ const MAX_VISIBLE_SAMPLES: usize = 1_500;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
     Plan,
+    StepEditor,
     VUsers,
     Monitor,
     Summary,
@@ -31,12 +32,20 @@ pub struct RoadcuseApp {
     project: Project,
     project_path: Option<PathBuf>,
     page: Page,
+    selected_case: (usize, usize),
+    selected_step: Option<(usize, usize, usize)>,
+    step_editor_tab: usize,
+    run_config_tab: usize,
+    summary_filter: usize,
     status: String,
     is_running: bool,
     stop_requested: bool,
     event_rx: Option<Receiver<EngineEvent>>,
+    preview_rx: Option<Receiver<SampleRecord>>,
     records: VecDeque<SampleRecord>,
     selected_record: Option<SampleRecord>,
+    preview_record: Option<SampleRecord>,
+    preview_pending: bool,
     detail_tab: usize,
     requests: u64,
     errors: u64,
@@ -62,12 +71,20 @@ impl RoadcuseApp {
             project: Project::default(),
             project_path: None,
             page: Page::Plan,
+            selected_case: (0, 0),
+            selected_step: None,
+            step_editor_tab: 0,
+            run_config_tab: 0,
+            summary_filter: 0,
             status: "Ready".into(),
             is_running: false,
             stop_requested: false,
             event_rx: None,
+            preview_rx: None,
             records: VecDeque::new(),
             selected_record: None,
+            preview_record: None,
+            preview_pending: false,
             detail_tab: 1,
             requests: 0,
             errors: 0,
@@ -106,6 +123,24 @@ impl RoadcuseApp {
     }
 
     fn receive_engine_events(&mut self) {
+        let mut previews = Vec::new();
+        if let Some(receiver) = &self.preview_rx {
+            while let Ok(record) = receiver.try_recv() {
+                previews.push(record);
+            }
+        }
+        for record in previews {
+            self.preview_pending = false;
+            self.status = if record.error.is_empty() {
+                format!(
+                    "Request completed · HTTP {} · {} ms",
+                    record.status, record.elapsed_ms
+                )
+            } else {
+                format!("Request failed · {}", record.error)
+            };
+            self.preview_record = Some(record);
+        }
         let mut events = Vec::new();
         if let Some(receiver) = &self.event_rx {
             while let Ok(event) = receiver.try_recv() {
@@ -221,6 +256,53 @@ impl RoadcuseApp {
         }
     }
 
+    fn send_preview(&mut self) {
+        let Some((module_index, case_index, step_index)) = self.selected_step else {
+            self.status = "Select an API step first".into();
+            return;
+        };
+        let Some(step) = self
+            .project
+            .modules
+            .get(module_index)
+            .and_then(|module| module.test_cases.get(case_index))
+            .and_then(|test_case| test_case.steps.get(step_index))
+            .cloned()
+        else {
+            self.status = "Selected API step no longer exists".into();
+            return;
+        };
+        let project = self.project.clone();
+        let (preview_tx, preview_rx) = mpsc::sync_channel(4);
+        self.preview_rx = Some(preview_rx);
+        self.preview_record = None;
+        self.preview_pending = true;
+        thread::spawn(move || {
+            let record = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime.block_on(engine::preview_request(&project, &step)),
+                Err(error) => SampleRecord {
+                    timestamp_ms: now_ms(),
+                    name: step.name.clone(),
+                    method: step.request.method.as_label().into(),
+                    url: step.request.url.clone(),
+                    request_headers: String::new(),
+                    request_body: step.request.body.clone(),
+                    status: 0,
+                    elapsed_ms: 0,
+                    success: false,
+                    response_body: String::new(),
+                    response_headers: String::new(),
+                    error: format!("could not start async runtime: {error}"),
+                },
+            };
+            let _ = preview_tx.try_send(record);
+        });
+        self.status = "Sending one-off request…".into();
+    }
+
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.heading(
@@ -235,6 +317,9 @@ impl RoadcuseApp {
                 .clicked()
             {
                 self.page = Page::Plan;
+            }
+            if self.page == Page::StepEditor {
+                ui.label(RichText::new("› Edit API").color(Color32::from_rgb(139, 101, 255)));
             }
             if ui
                 .selectable_label(self.page == Page::VUsers, "VUser & CSV")
@@ -302,134 +387,355 @@ impl RoadcuseApp {
     }
 
     fn plan_page(&mut self, ui: &mut egui::Ui) {
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            ui.heading("Project");
-            egui::Grid::new("project_options")
-                .num_columns(2)
-                .spacing([12.0, 8.0])
-                .show(ui, |ui| {
-                    ui.label("Name");
-                    ui.text_edit_singleline(&mut self.project.name);
-                    ui.end_row();
-                    ui.label("Description");
-                    ui.text_edit_singleline(&mut self.project.description);
-                    ui.end_row();
-                    ui.label("Base URL");
-                    ui.text_edit_singleline(&mut self.project.base_url);
-                    ui.end_row();
-                });
-            ui.add_space(8.0);
-            ui.collapsing("Environment & shared headers", |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("Active environment");
-                    egui::ComboBox::from_id_salt("active_environment")
-                        .selected_text(&self.project.active_environment)
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                &mut self.project.active_environment,
-                                "Default".into(),
-                                "Default project URL",
-                            );
-                            for environment in &self.project.environments {
-                                ui.selectable_value(
-                                    &mut self.project.active_environment,
-                                    environment.name.clone(),
-                                    &environment.name,
-                                );
+        let available = ui.available_size();
+        let left_width = (available.x * 0.69).max(420.0);
+        ui.horizontal_top(|ui| {
+            ui.allocate_ui_with_layout(
+                Vec2::new(left_width, available.y),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.heading(&self.project.name);
+                            if ui.small_button("Rename").clicked() {
+                                self.status = "Edit the project name in the field below".into();
                             }
                         });
-                    if ui.button("＋ Environment").clicked() {
-                        self.project.environments.push(EnvironmentProfile {
-                            name: format!("Environment {}", self.project.environments.len() + 1),
-                            base_url: self.project.base_url.clone(),
-                            ..Default::default()
+                        ui.horizontal(|ui| {
+                            ui.label("Project");
+                            ui.add_sized(
+                                [220.0, 26.0],
+                                egui::TextEdit::singleline(&mut self.project.name),
+                            );
+                            ui.label("Description");
+                            ui.text_edit_singleline(&mut self.project.description);
                         });
-                    }
-                });
-                if let Some(environment) = self
-                    .project
-                    .environments
-                    .iter_mut()
-                    .find(|environment| environment.name == self.project.active_environment)
-                {
-                    ui.horizontal(|ui| {
-                        ui.label("Name");
-                        ui.text_edit_singleline(&mut environment.name);
-                        ui.label("Base URL");
-                        ui.text_edit_singleline(&mut environment.base_url);
-                    });
-                    ui.label("Environment variables");
-                    edit_key_values(ui, "environment_variables", &mut environment.variables);
-                }
-                ui.label("Global headers");
-                edit_key_values(ui, "global_headers", &mut self.project.global_headers);
-            });
-            ui.add_space(12.0);
-            ui.separator();
-            ui.horizontal(|ui| {
-                ui.heading("Scenarios");
-                if ui.button("＋ Module").clicked() {
-                    self.project.modules.push(Default::default());
-                }
-            });
-            let mut remove_module = None;
-            for (module_index, module) in self.project.modules.iter_mut().enumerate() {
-                egui::CollapsingHeader::new(format!(
-                    "{}  ·  {} cases",
-                    module.name,
-                    module.test_cases.len()
-                ))
-                .id_salt(("module", module_index))
-                .default_open(true)
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.checkbox(&mut module.enabled, "Enabled");
-                        ui.text_edit_singleline(&mut module.name);
-                        if ui.button("＋ Case").clicked() {
-                            module.test_cases.push(Default::default());
-                        }
-                        if ui.button("Delete module").clicked() {
-                            remove_module = Some(module_index);
-                        }
-                    });
-                    ui.text_edit_singleline(&mut module.description);
-                    let mut remove_case = None;
-                    for (case_index, test_case) in module.test_cases.iter_mut().enumerate() {
-                        egui::CollapsingHeader::new(format!(
-                            "{}  ·  {} steps",
-                            test_case.name,
-                            test_case.steps.len()
-                        ))
-                        .id_salt(("case", module_index, case_index))
-                        .default_open(true)
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.checkbox(&mut test_case.enabled, "Enabled");
-                                ui.text_edit_singleline(&mut test_case.name);
-                                if ui.button("＋ Step").clicked() {
-                                    test_case.steps.push(Default::default());
+                        ui.add_space(12.0);
+                        ui.horizontal(|ui| {
+                            ui.label("Module");
+                            egui::ComboBox::from_id_salt("plan_module")
+                                .selected_text(
+                                    self.project
+                                        .modules
+                                        .get(self.selected_case.0)
+                                        .map(|module| module.name.as_str())
+                                        .unwrap_or("No module"),
+                                )
+                                .show_ui(ui, |ui| {
+                                    for (index, module) in self.project.modules.iter().enumerate() {
+                                        ui.selectable_value(
+                                            &mut self.selected_case.0,
+                                            index,
+                                            &module.name,
+                                        );
+                                    }
+                                });
+                            if ui.button("＋ Module").clicked() {
+                                self.project.modules.push(Default::default());
+                                self.selected_case = (self.project.modules.len() - 1, 0);
+                            }
+                            if let Some(module) = self.project.modules.get_mut(self.selected_case.0)
+                            {
+                                ui.label("Test case");
+                                egui::ComboBox::from_id_salt("plan_case")
+                                    .selected_text(
+                                        module
+                                            .test_cases
+                                            .get(self.selected_case.1)
+                                            .map(|case| case.name.as_str())
+                                            .unwrap_or("No case"),
+                                    )
+                                    .show_ui(ui, |ui| {
+                                        for (index, test_case) in
+                                            module.test_cases.iter().enumerate()
+                                        {
+                                            ui.selectable_value(
+                                                &mut self.selected_case.1,
+                                                index,
+                                                &test_case.name,
+                                            );
+                                        }
+                                    });
+                                if ui.button("＋ Case").clicked() {
+                                    module.test_cases.push(Default::default());
+                                    self.selected_case.1 = module.test_cases.len() - 1;
                                 }
-                                if ui.button("Delete case").clicked() {
-                                    remove_case = Some(case_index);
+                            }
+                        });
+
+                        let (module_index, case_index) = self.selected_case;
+                        if let Some(test_case) = self
+                            .project
+                            .modules
+                            .get_mut(module_index)
+                            .and_then(|module| module.test_cases.get_mut(case_index))
+                        {
+                            ui.horizontal(|ui| {
+                                ui.heading(&test_case.name);
+                                ui.checkbox(&mut test_case.enabled, "Enabled");
+                                ui.text_edit_singleline(&mut test_case.description);
+                            });
+                            ui.add_space(8.0);
+                            let mut open_step = None;
+                            let mut delete_step = None;
+                            let mut move_step = None;
+                            let step_count = test_case.steps.len();
+                            for (index, step) in test_case.steps.iter_mut().enumerate() {
+                                egui::Frame::group(ui.style())
+                                    .inner_margin(egui::Margin::symmetric(10, 8))
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.label(RichText::new("⠿").weak());
+                                            ui.label(
+                                                RichText::new((index + 1).to_string())
+                                                    .color(Color32::GRAY),
+                                            );
+                                            ui.checkbox(&mut step.enabled, "");
+                                            ui.label(
+                                                RichText::new(step.request.method.as_label())
+                                                    .strong()
+                                                    .color(method_color(step.request.method)),
+                                            );
+                                            ui.vertical(|ui| {
+                                                ui.text_edit_singleline(&mut step.name);
+                                                ui.label(
+                                                    RichText::new(&step.request.url).small().weak(),
+                                                );
+                                            });
+                                            if ui.button("Edit API").clicked() {
+                                                open_step = Some((module_index, case_index, index));
+                                            }
+                                            if ui.small_button("↑").clicked() && index > 0 {
+                                                move_step = Some((index, index - 1));
+                                            }
+                                            if ui.small_button("↓").clicked()
+                                                && index + 1 < step_count
+                                            {
+                                                move_step = Some((index, index + 1));
+                                            }
+                                            if ui.small_button("×").clicked() {
+                                                delete_step = Some(index);
+                                            }
+                                        });
+                                    });
+                                ui.add_space(4.0);
+                            }
+                            if let Some((from, to)) = move_step {
+                                test_case.steps.swap(from, to);
+                            }
+                            if let Some(index) = delete_step {
+                                if index < test_case.steps.len() {
+                                    test_case.steps.remove(index);
+                                }
+                            }
+                            if let Some(target) = open_step {
+                                self.selected_step = Some(target);
+                            }
+                            egui::ComboBox::from_id_salt("add_plan_step")
+                                .selected_text("＋ Add Steps")
+                                .width(ui.available_width())
+                                .show_ui(ui, |ui| {
+                                    if ui.selectable_label(false, "HTTP Request").clicked() {
+                                        test_case.steps.push(Default::default());
+                                    }
+                                    ui.separator();
+                                    ui.add_enabled(false, egui::Label::new("Reference test case"));
+                                    ui.add_enabled(false, egui::Label::new("Condition / Loop"));
+                                });
+                            if let Some(target) = self.selected_step.take() {
+                                self.selected_step = Some(target);
+                                if target.0 == module_index && target.1 == case_index {
+                                    self.page = Page::StepEditor;
+                                }
+                            }
+                        } else {
+                            ui.add_space(12.0);
+                            ui.label(
+                                "Add a module and test case to start building the request flow.",
+                            );
+                        }
+                    });
+                },
+            );
+            ui.separator();
+            ui.allocate_ui_with_layout(
+                Vec2::new((available.x - left_width - 12.0).max(300.0), available.y),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .selectable_label(self.run_config_tab == 0, "Functional")
+                            .clicked()
+                        {
+                            self.run_config_tab = 0;
+                        }
+                        if ui
+                            .selectable_label(self.run_config_tab == 1, "Performance")
+                            .clicked()
+                        {
+                            self.run_config_tab = 1;
+                        }
+                    });
+                    ui.separator();
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        egui::Frame::group(ui.style())
+                            .inner_margin(egui::Margin::same(12))
+                            .show(ui, |ui| {
+                                ui.heading("Run Config");
+                                if self.run_config_tab == 0 {
+                                    ui.label("Environment");
+                                    egui::ComboBox::from_id_salt("run_environment")
+                                        .selected_text(&self.project.active_environment)
+                                        .width(ui.available_width())
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(
+                                                &mut self.project.active_environment,
+                                                "Default".into(),
+                                                "Default",
+                                            );
+                                            for environment in &self.project.environments {
+                                                ui.selectable_value(
+                                                    &mut self.project.active_environment,
+                                                    environment.name.clone(),
+                                                    &environment.name,
+                                                );
+                                            }
+                                        });
+                                    ui.add_space(8.0);
+                                    ui.label("Base URL");
+                                    let base_url = self
+                                        .project
+                                        .environments
+                                        .iter_mut()
+                                        .find(|environment| {
+                                            environment.name == self.project.active_environment
+                                        })
+                                        .map(|environment| &mut environment.base_url);
+                                    if let Some(base_url) = base_url {
+                                        ui.text_edit_singleline(base_url);
+                                    } else {
+                                        ui.text_edit_singleline(&mut self.project.base_url);
+                                    }
+                                    if ui.button("＋ Environment").clicked() {
+                                        self.project.environments.push(EnvironmentProfile {
+                                            name: format!(
+                                                "Environment {}",
+                                                self.project.environments.len() + 1
+                                            ),
+                                            base_url: self.project.base_url.clone(),
+                                            ..Default::default()
+                                        });
+                                        self.project.active_environment = self
+                                            .project
+                                            .environments
+                                            .last()
+                                            .map(|environment| environment.name.clone())
+                                            .unwrap_or_default();
+                                    }
+                                    ui.collapsing("Environment variables", |ui| {
+                                        if let Some(environment) = self
+                                            .project
+                                            .environments
+                                            .iter_mut()
+                                            .find(|environment| {
+                                                environment.name == self.project.active_environment
+                                            })
+                                        {
+                                            edit_key_values(
+                                                ui,
+                                                "run_environment_variables",
+                                                &mut environment.variables,
+                                            );
+                                        }
+                                    });
+                                    ui.collapsing("Shared headers", |ui| {
+                                        edit_key_values(
+                                            ui,
+                                            "run_shared_headers",
+                                            &mut self.project.global_headers,
+                                        );
+                                    });
+                                } else {
+                                    ui.label("Virtual users");
+                                    ui.add(
+                                        egui::DragValue::new(
+                                            &mut self.project.vuser_config.thread_count,
+                                        )
+                                        .range(1..=100_000),
+                                    );
+                                    ui.label("Ramp-up (seconds)");
+                                    ui.add(
+                                        egui::DragValue::new(
+                                            &mut self.project.vuser_config.ramp_up_seconds,
+                                        )
+                                        .range(0..=86_400),
+                                    );
+                                    ui.horizontal(|ui| {
+                                        ui.selectable_value(
+                                            &mut self.project.vuser_config.duration_based,
+                                            false,
+                                            "Iterations",
+                                        );
+                                        ui.selectable_value(
+                                            &mut self.project.vuser_config.duration_based,
+                                            true,
+                                            "Duration",
+                                        );
+                                    });
+                                    if self.project.vuser_config.duration_based {
+                                        ui.add(
+                                            egui::DragValue::new(
+                                                &mut self.project.vuser_config.duration_seconds,
+                                            )
+                                            .range(1..=86_400)
+                                            .suffix(" sec"),
+                                        );
+                                    } else {
+                                        ui.add(
+                                            egui::DragValue::new(
+                                                &mut self.project.vuser_config.loop_count,
+                                            )
+                                            .range(1..=1_000_000)
+                                            .suffix(" runs/user"),
+                                        );
+                                    }
+                                    ui.separator();
+                                    ui.checkbox(
+                                        &mut self.project.vuser_config.use_csv_data,
+                                        "Use CSV data",
+                                    );
+                                    if self.project.vuser_config.use_csv_data {
+                                        ui.text_edit_singleline(
+                                            &mut self.project.vuser_config.csv_file_path,
+                                        );
+                                        if ui.button("Browse CSV…").clicked() {
+                                            if let Some(path) = rfd::FileDialog::new()
+                                                .add_filter("CSV", &["csv"])
+                                                .pick_file()
+                                            {
+                                                self.project.vuser_config.csv_file_path =
+                                                    path.to_string_lossy().into_owned();
+                                            }
+                                        }
+                                    }
                                 }
                             });
-                            for (step_index, step) in test_case.steps.iter_mut().enumerate() {
-                                edit_step(ui, step, (module_index, case_index, step_index));
+                    });
+                    ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(!self.is_running, egui::Button::new("▶ Run"))
+                                .clicked()
+                            {
+                                self.start_run();
+                            }
+                            if ui.button("Save").clicked() {
+                                self.save_project();
                             }
                         });
-                    }
-                    if let Some(index) = remove_case {
-                        if index < module.test_cases.len() {
-                            module.test_cases.remove(index);
-                        }
-                    }
-                });
-            }
-            if let Some(index) = remove_module {
-                if index < self.project.modules.len() {
-                    self.project.modules.remove(index);
-                }
-            }
+                    });
+                },
+            );
         });
     }
 
@@ -548,6 +854,259 @@ impl RoadcuseApp {
                 );
             });
         });
+    }
+
+    fn step_editor_page(&mut self, ui: &mut egui::Ui) {
+        let Some((module_index, case_index, step_index)) = self.selected_step else {
+            ui.label("Choose a request from the test plan.");
+            if ui.button("Back to Test Plan").clicked() {
+                self.page = Page::Plan;
+            }
+            return;
+        };
+        let base_url = self.project.active_base_url().to_owned();
+        let mut send_request = false;
+        let Some(step) = self
+            .project
+            .modules
+            .get_mut(module_index)
+            .and_then(|module| module.test_cases.get_mut(case_index))
+            .and_then(|test_case| test_case.steps.get_mut(step_index))
+        else {
+            self.selected_step = None;
+            self.page = Page::Plan;
+            ui.label("This request step has been removed.");
+            return;
+        };
+        let step_title = step.name.clone();
+        let mut save_project = false;
+
+        ui.horizontal(|ui| {
+            if ui.button("‹ Test Plan").clicked() {
+                self.page = Page::Plan;
+            }
+            ui.heading(format!("Edit API · {}", step_title));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Save").clicked() {
+                    save_project = true;
+                }
+                if ui.button("Send").clicked() {
+                    send_request = true;
+                }
+            });
+        });
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_salt("editor_method")
+                .selected_text(step.request.method.as_label())
+                .show_ui(ui, |ui| {
+                    for method in [
+                        HttpMethod::Get,
+                        HttpMethod::Post,
+                        HttpMethod::Put,
+                        HttpMethod::Delete,
+                        HttpMethod::Patch,
+                        HttpMethod::Head,
+                        HttpMethod::Options,
+                    ] {
+                        ui.selectable_value(&mut step.request.method, method, method.as_label());
+                    }
+                });
+            ui.label(RichText::new(base_url).weak());
+            ui.add_sized(
+                [ui.available_width(), 32.0],
+                egui::TextEdit::singleline(&mut step.request.url)
+                    .hint_text("/api/path or full URL"),
+            );
+        });
+        ui.horizontal(|ui| {
+            for (index, title) in [
+                "Headers",
+                "Params",
+                "Path",
+                "Body",
+                "Extractors",
+                "Assertions",
+            ]
+            .iter()
+            .enumerate()
+            {
+                if ui
+                    .selectable_label(self.step_editor_tab == index, *title)
+                    .clicked()
+                {
+                    self.step_editor_tab = index;
+                }
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label("HTTP/1.1");
+                ui.add(egui::DragValue::new(&mut step.request.timeout_ms).suffix(" ms"));
+                ui.label("Timeout");
+            });
+        });
+        ui.separator();
+        egui::Frame::group(ui.style())
+            .inner_margin(egui::Margin::symmetric(12, 10))
+            .show(ui, |ui| match self.step_editor_tab {
+                0 => {
+                    ui.label(RichText::new("Request Headers").strong());
+                    edit_key_values(ui, "api_editor_headers", &mut step.request.headers);
+                }
+                1 => {
+                    ui.label(RichText::new("Query Parameters").strong());
+                    edit_key_values(ui, "api_editor_params", &mut step.request.query_params);
+                }
+                2 => {
+                    ui.label(RichText::new("Path Variables").strong());
+                    ui.label("Use {name} or :name in the URL. Values can use ${variable}.");
+                    edit_key_values(ui, "api_editor_path", &mut step.request.path_variables);
+                }
+                3 => {
+                    ui.horizontal(|ui| {
+                        ui.label("Body type");
+                        egui::ComboBox::from_id_salt("api_editor_body_type")
+                            .selected_text(format!("{:?}", step.request.body_type))
+                            .show_ui(ui, |ui| {
+                                for body_type in [
+                                    BodyType::None,
+                                    BodyType::Json,
+                                    BodyType::Raw,
+                                    BodyType::FormData,
+                                ] {
+                                    ui.selectable_value(
+                                        &mut step.request.body_type,
+                                        body_type,
+                                        format!("{body_type:?}"),
+                                    );
+                                }
+                            });
+                    });
+                    if step.request.body_type != BodyType::None {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut step.request.body)
+                                .desired_rows(12)
+                                .code_editor()
+                                .hint_text("Request body. Variables use ${name}."),
+                        );
+                    }
+                }
+                4 => {
+                    ui.label("Extract values from the response for later requests.");
+                    for (index, extractor) in step.extractors.iter_mut().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut extractor.enabled, "");
+                            ui.text_edit_singleline(&mut extractor.variable_name);
+                            egui::ComboBox::from_id_salt(("api_extractor_type", index))
+                                .selected_text(format!("{:?}", extractor.extractor_type))
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut extractor.extractor_type,
+                                        ExtractorType::JsonPath,
+                                        "JSONPath",
+                                    );
+                                    ui.selectable_value(
+                                        &mut extractor.extractor_type,
+                                        ExtractorType::Regex,
+                                        "Regex",
+                                    );
+                                });
+                            ui.text_edit_singleline(&mut extractor.expression);
+                        });
+                    }
+                    if ui.button("＋ Add extractor").clicked() {
+                        step.extractors.push(VariableExtractor {
+                            enabled: true,
+                            variable_name: "token".into(),
+                            expression: "$.token".into(),
+                            ..Default::default()
+                        });
+                    }
+                }
+                _ => {
+                    ui.label("Validate the response from this step.");
+                    for (index, assertion) in step.assertions.iter_mut().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut assertion.enabled, "");
+                            egui::ComboBox::from_id_salt(("api_assertion_type", index))
+                                .selected_text(format!("{:?}", assertion.assertion_type))
+                                .show_ui(ui, |ui| {
+                                    for assertion_type in [
+                                        AssertionType::StatusCode,
+                                        AssertionType::ResponseBodyContains,
+                                        AssertionType::ResponseTimeLt,
+                                        AssertionType::JsonPathExists,
+                                    ] {
+                                        ui.selectable_value(
+                                            &mut assertion.assertion_type,
+                                            assertion_type,
+                                            format!("{assertion_type:?}"),
+                                        );
+                                    }
+                                });
+                            ui.text_edit_singleline(&mut assertion.expected_value);
+                            ui.text_edit_singleline(&mut assertion.description);
+                        });
+                    }
+                    if ui.button("＋ Add assertion").clicked() {
+                        step.assertions.push(StepAssertion {
+                            enabled: true,
+                            expected_value: "200".into(),
+                            ..Default::default()
+                        });
+                    }
+                }
+            });
+        ui.separator();
+        ui.horizontal(|ui| {
+            for (index, title) in ["Response", "Headers", "Actual Request", "Console"]
+                .iter()
+                .enumerate()
+            {
+                if ui
+                    .selectable_label(self.detail_tab == index, *title)
+                    .clicked()
+                {
+                    self.detail_tab = index;
+                }
+            }
+        });
+        if let Some(preview) = &self.preview_record {
+            ui.label(format!(
+                "{} · HTTP {} · {} ms {}",
+                preview.method,
+                preview.status,
+                preview.elapsed_ms,
+                if preview.success {
+                    "· passed"
+                } else {
+                    "· failed"
+                }
+            ));
+            let (title, content) = match self.detail_tab {
+                1 => ("Response Headers", preview.response_headers.clone()),
+                2 => (
+                    "Actual Request",
+                    format!("{}\n\n{}", preview.request_headers, preview.request_body),
+                ),
+                3 => ("Console", preview.error.clone()),
+                _ => ("Response Body", preview.response_body.clone()),
+            };
+            ui.label(RichText::new(title).strong());
+            let mut content = content;
+            ui.add(
+                egui::TextEdit::multiline(&mut content)
+                    .desired_rows(8)
+                    .code_editor()
+                    .interactive(false),
+            );
+        } else {
+            ui.label("Send a request to view its response.");
+        }
+        if send_request {
+            self.send_preview();
+        }
+        if save_project {
+            self.save_project();
+        }
     }
 
     fn monitor_page(&mut self, ui: &mut egui::Ui) {
@@ -735,6 +1294,7 @@ impl RoadcuseApp {
     }
 
     fn summary_page(&mut self, ui: &mut egui::Ui) {
+        let mut open_record = None;
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.heading("Summary Report");
             let Some(summary) = self.summary.as_ref() else {
@@ -796,7 +1356,62 @@ impl RoadcuseApp {
                         });
                 });
             ui.weak("Sampler rows use the bounded request sample set saved with this run.");
+            ui.add_space(12.0);
+            ui.separator();
+            ui.label(RichText::new("Request Results").strong());
+            ui.horizontal(|ui| {
+                for (index, label) in [(0, "All"), (1, "Passed"), (2, "Failed")] {
+                    if ui
+                        .selectable_label(self.summary_filter == index, label)
+                        .clicked()
+                    {
+                        self.summary_filter = index;
+                    }
+                }
+            });
+            egui::ScrollArea::vertical()
+                .max_height(300.0)
+                .show(ui, |ui| {
+                    egui::Grid::new("summary_request_results")
+                        .striped(true)
+                        .show(ui, |ui| {
+                            for heading in ["Result", "Method", "Request", "Status", "Latency"] {
+                                ui.strong(heading);
+                            }
+                            ui.end_row();
+                            for sample in summary.recent_samples.iter().rev().filter(|sample| {
+                                match self.summary_filter {
+                                    1 => sample.success,
+                                    2 => !sample.success,
+                                    _ => true,
+                                }
+                            }) {
+                                let result = ui.selectable_label(
+                                    false,
+                                    RichText::new(if sample.success { "PASS" } else { "FAIL" })
+                                        .color(if sample.success {
+                                            Color32::from_rgb(92, 210, 151)
+                                        } else {
+                                            Color32::from_rgb(255, 112, 112)
+                                        }),
+                                );
+                                if result.clicked() {
+                                    open_record = Some(sample.clone());
+                                }
+                                ui.label(&sample.method);
+                                ui.label(&sample.name);
+                                ui.label(sample.status.to_string());
+                                ui.label(format!("{} ms", sample.elapsed_ms));
+                                ui.end_row();
+                            }
+                        });
+                });
         });
+        if let Some(record) = open_record {
+            self.selected_record = Some(record);
+            self.detail_tab = 1;
+            self.page = Page::Monitor;
+        }
     }
 
     fn history_page(&mut self, ui: &mut egui::Ui) {
@@ -886,6 +1501,7 @@ impl eframe::App for RoadcuseApp {
         ui.add_space(4.0);
         match self.page {
             Page::Plan => self.plan_page(ui),
+            Page::StepEditor => self.step_editor_page(ui),
             Page::VUsers => self.vuser_page(ui),
             Page::Monitor => self.monitor_page(ui),
             Page::Summary => self.summary_page(ui),
@@ -893,6 +1509,9 @@ impl eframe::App for RoadcuseApp {
         }
         if self.is_running {
             ui.ctx().request_repaint_after(Duration::from_millis(200));
+        }
+        if self.preview_pending {
+            ui.ctx().request_repaint_after(Duration::from_millis(100));
         }
     }
 }
@@ -913,147 +1532,6 @@ fn run_on_worker(project: Project, tx: SyncSender<EngineEvent>) {
     if let Err(error) = runtime.block_on(engine::run_project(project, tx.clone())) {
         let _ = tx.try_send(EngineEvent::Failed(format!("{error:#}")));
     }
-}
-
-fn edit_step(ui: &mut egui::Ui, step: &mut TestStep, salt: (usize, usize, usize)) {
-    egui::CollapsingHeader::new(format!(
-        "{}  ·  {}",
-        step.request.method.as_label(),
-        step.name
-    ))
-    .id_salt(("step", salt))
-    .show(ui, |ui| {
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut step.enabled, "Enabled");
-            egui::ComboBox::from_id_salt(("method", salt))
-                .selected_text(step.request.method.as_label())
-                .show_ui(ui, |ui| {
-                    for method in [
-                        HttpMethod::Get,
-                        HttpMethod::Post,
-                        HttpMethod::Put,
-                        HttpMethod::Delete,
-                        HttpMethod::Patch,
-                        HttpMethod::Head,
-                        HttpMethod::Options,
-                    ] {
-                        ui.selectable_value(&mut step.request.method, method, method.as_label());
-                    }
-                });
-            ui.text_edit_singleline(&mut step.name);
-            ui.label("Delay ms");
-            ui.add(egui::DragValue::new(&mut step.delay_ms).range(0..=60_000));
-        });
-        ui.horizontal(|ui| {
-            ui.label("URL");
-            ui.text_edit_singleline(&mut step.request.url);
-        });
-        ui.collapsing("Query parameters", |ui| {
-            edit_key_values(ui, ("query", salt), &mut step.request.query_params);
-        });
-        ui.collapsing("Path variables", |ui| {
-            edit_key_values(ui, ("path", salt), &mut step.request.path_variables);
-        });
-        ui.horizontal(|ui| {
-            ui.label("Timeout ms");
-            ui.add(egui::DragValue::new(&mut step.request.timeout_ms).range(1..=600_000));
-            ui.label("Body type");
-            egui::ComboBox::from_id_salt(("body_type", salt))
-                .selected_text(format!("{:?}", step.request.body_type))
-                .show_ui(ui, |ui| {
-                    for body_type in [
-                        BodyType::None,
-                        BodyType::Json,
-                        BodyType::Raw,
-                        BodyType::FormData,
-                    ] {
-                        ui.selectable_value(
-                            &mut step.request.body_type,
-                            body_type,
-                            format!("{body_type:?}"),
-                        );
-                    }
-                });
-        });
-        if step.request.body_type != BodyType::None {
-            ui.add(
-                egui::TextEdit::multiline(&mut step.request.body)
-                    .desired_rows(5)
-                    .code_editor()
-                    .hint_text("Request body; use ${variable} for values"),
-            );
-        }
-        ui.collapsing("Headers", |ui| {
-            edit_key_values(ui, ("headers", salt), &mut step.request.headers);
-        });
-        ui.collapsing("Response variable extractors", |ui| {
-            for (index, extractor) in step.extractors.iter_mut().enumerate() {
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut extractor.enabled, "");
-                    ui.text_edit_singleline(&mut extractor.variable_name);
-                    egui::ComboBox::from_id_salt(("extractor_type", salt, index))
-                        .selected_text(format!("{:?}", extractor.extractor_type))
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                &mut extractor.extractor_type,
-                                ExtractorType::JsonPath,
-                                "JSONPath",
-                            );
-                            ui.selectable_value(
-                                &mut extractor.extractor_type,
-                                ExtractorType::Regex,
-                                "Regex",
-                            );
-                        });
-                    ui.text_edit_singleline(&mut extractor.expression);
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Default value");
-                    ui.text_edit_singleline(&mut extractor.default_value);
-                });
-            }
-            if ui.small_button("＋ Extractor").clicked() {
-                step.extractors.push(VariableExtractor {
-                    enabled: true,
-                    variable_name: "token".into(),
-                    expression: "$.token".into(),
-                    ..Default::default()
-                });
-            }
-        });
-        ui.collapsing("Assertions", |ui| {
-            for (index, assertion) in step.assertions.iter_mut().enumerate() {
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut assertion.enabled, "");
-                    egui::ComboBox::from_id_salt(("assertion_type", salt, index))
-                        .selected_text(format!("{:?}", assertion.assertion_type))
-                        .show_ui(ui, |ui| {
-                            for assertion_type in [
-                                AssertionType::StatusCode,
-                                AssertionType::ResponseBodyContains,
-                                AssertionType::ResponseTimeLt,
-                                AssertionType::JsonPathExists,
-                            ] {
-                                ui.selectable_value(
-                                    &mut assertion.assertion_type,
-                                    assertion_type,
-                                    format!("{assertion_type:?}"),
-                                );
-                            }
-                        });
-                    ui.text_edit_singleline(&mut assertion.expected_value);
-                    ui.text_edit_singleline(&mut assertion.description);
-                });
-            }
-            if ui.small_button("＋ Assertion").clicked() {
-                step.assertions.push(StepAssertion {
-                    enabled: true,
-                    expected_value: "200".into(),
-                    ..Default::default()
-                });
-            }
-        });
-    });
 }
 
 fn edit_key_values(
@@ -1099,6 +1577,17 @@ impl MethodLabel for HttpMethod {
             HttpMethod::Head => "HEAD",
             HttpMethod::Options => "OPTIONS",
         }
+    }
+}
+
+fn method_color(method: HttpMethod) -> Color32 {
+    match method {
+        HttpMethod::Get => Color32::from_rgb(37, 192, 145),
+        HttpMethod::Post => Color32::from_rgb(245, 174, 59),
+        HttpMethod::Put => Color32::from_rgb(86, 154, 245),
+        HttpMethod::Delete => Color32::from_rgb(240, 102, 112),
+        HttpMethod::Patch => Color32::from_rgb(170, 121, 247),
+        HttpMethod::Head | HttpMethod::Options => Color32::from_rgb(114, 173, 220),
     }
 }
 

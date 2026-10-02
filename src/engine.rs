@@ -144,6 +144,129 @@ pub async fn run_project(project: Project, event_tx: SyncSender<EngineEvent>) ->
     }
 }
 
+pub async fn preview_request(project: &Project, step: &TestStep) -> SampleRecord {
+    let started = Instant::now();
+    let mut variables = HashMap::new();
+    for (key, value) in project.active_variables() {
+        variables.insert(key.to_owned(), value.to_owned());
+    }
+    let raw_url = substitute(&step.request.url, &variables);
+    let mut url = Url::parse(&raw_url)
+        .or_else(|_| Url::parse(project.active_base_url()).and_then(|base| base.join(&raw_url)));
+    let mut display_url = String::new();
+    let mut headers = String::new();
+    let body = substitute(&step.request.body, &variables);
+    let mut response_headers = String::new();
+    let mut response_body = String::new();
+    let mut status = 0;
+    let mut error = String::new();
+
+    let result = async {
+        let parsed_url = url
+            .as_mut()
+            .map_err(|error| anyhow::anyhow!("invalid URL: {error}"))?;
+        let mut path = parsed_url.path().to_owned();
+        for variable in &step.request.path_variables {
+            if variable.enabled && !variable.key.is_empty() {
+                let value = substitute(&variable.value, &variables);
+                path = path.replace(&format!(":{}", variable.key), &value);
+                path = path.replace(&format!("{{{}}}", variable.key), &value);
+            }
+        }
+        parsed_url.set_path(&path);
+        let query = step
+            .request
+            .query_params
+            .iter()
+            .filter(|pair| pair.enabled && !pair.key.is_empty())
+            .map(|pair| (pair.key.clone(), substitute(&pair.value, &variables)))
+            .collect::<Vec<_>>();
+        display_url = parsed_url.to_string();
+        if !query.is_empty() {
+            let mut shown_url = parsed_url.clone();
+            shown_url.query_pairs_mut().extend_pairs(query.iter());
+            display_url = shown_url.to_string();
+        }
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(step.request.timeout_ms.max(1)))
+            .build()?;
+        let method = reqwest_method(step.request.method)?;
+        let mut request = client.request(method, parsed_url.as_str()).query(&query);
+        let configured_headers = project
+            .global_headers
+            .iter()
+            .chain(step.request.headers.iter())
+            .filter(|pair| pair.enabled && !pair.key.trim().is_empty())
+            .map(|pair| {
+                (
+                    pair.key.trim().to_owned(),
+                    substitute(&pair.value, &variables),
+                )
+            })
+            .collect::<Vec<_>>();
+        for (key, value) in &configured_headers {
+            request = request.header(key, value);
+        }
+        if step.request.body_type != BodyType::None && !body.is_empty() {
+            if step.request.body_type == BodyType::Json
+                && !configured_headers
+                    .iter()
+                    .any(|(key, _)| key.eq_ignore_ascii_case("content-type"))
+            {
+                request = request.header("content-type", "application/json");
+            }
+            if step.request.body_type == BodyType::FormData
+                && !configured_headers
+                    .iter()
+                    .any(|(key, _)| key.eq_ignore_ascii_case("content-type"))
+            {
+                request = request.header("content-type", "application/x-www-form-urlencoded");
+            }
+            request = request.body(body.clone());
+        }
+        headers = configured_headers
+            .iter()
+            .map(|(key, value)| format!("{key}: {value}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let response = request.send().await?;
+        status = response.status().as_u16();
+        response_headers = response
+            .headers()
+            .iter()
+            .map(|(key, value)| format!("{}: {}", key, value.to_str().unwrap_or("<binary>")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        response_body = response.text().await?;
+        anyhow::Ok(())
+    }
+    .await;
+
+    if let Err(request_error) = result {
+        error = request_error.to_string();
+    }
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    SampleRecord {
+        timestamp_ms: epoch_ms(),
+        name: step.name.clone(),
+        method: format!("{:?}", step.request.method).to_uppercase(),
+        url: if display_url.is_empty() {
+            step.request.url.clone()
+        } else {
+            display_url
+        },
+        request_headers: truncate(&headers, 16_384),
+        request_body: truncate(&body, 16_384),
+        status,
+        elapsed_ms,
+        success: error.is_empty() && (200..300).contains(&status),
+        response_body: truncate(&response_body, 16_384),
+        response_headers: truncate(&response_headers, 16_384),
+        error,
+    }
+}
+
 async fn execute_goose(host: &str, project: &Project) -> Result<()> {
     let config = &project.vuser_config;
     let startup_time = config.ramp_up_seconds;
