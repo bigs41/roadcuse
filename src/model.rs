@@ -256,6 +256,18 @@ impl Project {
             .unwrap_or(self.base_url.as_str())
     }
 
+    pub fn active_base_url_mut(&mut self) -> &mut String {
+        if let Some(environment) = self
+            .environments
+            .iter_mut()
+            .find(|environment| environment.name == self.active_environment)
+        {
+            &mut environment.base_url
+        } else {
+            &mut self.base_url
+        }
+    }
+
     pub fn active_variables(&self) -> impl Iterator<Item = (&str, &str)> {
         self.environments
             .iter()

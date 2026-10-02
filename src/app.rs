@@ -473,6 +473,13 @@ impl RoadcuseApp {
                 if ui.add(egui::Button::new("Open")).clicked() {
                     self.open_project();
                 }
+                ui.label(RichText::new("Target URL").weak());
+                ui.add_sized(
+                    [300.0, 30.0],
+                    egui::TextEdit::singleline(self.project.active_base_url_mut())
+                        .hint_text("https://example.com"),
+                )
+                .on_hover_text("Base URL used by this environment for test requests");
                 if ui
                     .button(format!(
                         "⚙ {} ({})",
@@ -790,9 +797,17 @@ impl RoadcuseApp {
                                         })
                                         .map(|environment| &mut environment.base_url);
                                     if let Some(base_url) = base_url {
-                                        ui.text_edit_singleline(base_url);
+                                        ui.add_sized(
+                                            [ui.available_width(), 32.0],
+                                            egui::TextEdit::singleline(base_url)
+                                                .hint_text("https://example.com"),
+                                        );
                                     } else {
-                                        ui.text_edit_singleline(&mut self.project.base_url);
+                                        ui.add_sized(
+                                            [ui.available_width(), 32.0],
+                                            egui::TextEdit::singleline(&mut self.project.base_url)
+                                                .hint_text("https://example.com"),
+                                        );
                                     }
                                     if ui.button("＋ Environment").clicked() {
                                         self.project.environments.push(EnvironmentProfile {
